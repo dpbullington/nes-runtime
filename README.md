@@ -126,7 +126,11 @@ renders and plays sound**: the sample game draws a background border and bitmap-
 intro jingle plus a blip when the hero bumps a wall, and moves a hero sprite with the on-screen
 D-pad. Here is a frame captured straight from the runtime's framebuffer (3× nearest-neighbor):
 
-![Rendered frame: blue border, black backdrop, "HELLO NES" in white, hero sprite](docs/sample-frame.png)
+![Rendered frame: blue border, black backdrop, "Hello, NES!" text, hero sprite](docs/sample-frame.png)
+
+The sample game ships an 8×8 bitmap font covering every printable ASCII character (0x20–0x7E):
+
+![Font sheet: all 95 printable ASCII glyphs rendered by the runtime](docs/font-sheet.png)
 
 It targets the desktop platforms: **Mac Catalyst** (built on macOS) and **Windows** (built on
 Windows). Each OS builds only the target it can produce, so the solution builds cleanly in Rider or
