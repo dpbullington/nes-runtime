@@ -1,0 +1,23 @@
+<Project>
+
+  <!-- Shared settings applied to every project in the NesRuntime solution.
+       Note: the target framework is intentionally NOT set here. The SDK class libraries pin
+       net10.0 in their own csproj; the MAUI host multi-targets platform monikers
+       (net10.0-maccatalyst, etc.) via <TargetFrameworks> and would conflict with a shared
+       singular <TargetFramework>. -->
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Skeleton stage: methods intentionally throw NotImplementedException.
+         1591 = missing XML doc (docs are added incrementally as the surface stabilizes).
+         0067 = declared events not yet raised (they are part of the intended API surface). -->
+    <NoWarn>$(NoWarn);CS1591;CS0067</NoWarn>
+    <Authors>NesRuntime</Authors>
+    <Product>NesRuntime</Product>
+    <Company>NesRuntime</Company>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,141 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+NesRuntime lets people **write NES games in C#** and run them against a modern GUI. It is a
+**runtime, not an emulator**: there is no 6502 opcode interpreter and no pre-built `.nes` ROM is
+executed. Game logic is authored in C# against the SDK, and the runtime maps it onto a
+hardware-faithful model of the NES.
+
+Current state: **API skeleton with a working render slice.** The full surface exists and is
+XML-documented. One vertical slice is implemented end-to-end (see "Implemented render path" below);
+the rest of the bodies still throw `NotImplementedException`. The libraries compile with 0 warnings
+and the Mac Catalyst host renders real frames.
+
+## Build & test
+
+```sh
+# The three SDK libraries — no workload needed, expected 0 warnings / 0 errors:
+dotnet build src/NesRuntime.Sdk/NesRuntime.Sdk.csproj
+
+# The whole solution — builds clean on macOS (host → Mac Catalyst) or Windows (host → Windows):
+dotnet build NesRuntime.slnx
+```
+
+- Requires the **.NET 10 SDK** (10.x installed). The solution file is the newer **`.slnx`** format
+  (`NesRuntime.slnx`), not `.sln`.
+- The **MAUI workload is installed** in this environment. The host targets **desktop only** — Mac
+  Catalyst on macOS, Windows on Windows (each conditioned by OS). So `dotnet build NesRuntime.slnx`
+  and Rider's solution build succeed on either without the Android SDK or Xcode iOS simulators.
+  Mac Catalyst is the verified-runnable target (builds 0/0). **Android/iOS targets were removed**
+  because they need those platform SDKs; re-add `net10.0-android`/`net10.0-ios` to the host
+  `<TargetFrameworks>` once the SDKs are installed.
+- Watch for **name collisions with MAUI's implicit usings** in host code: `Microsoft.Maui.Controls`
+  is globally imported, so its `Button`/`Region`/etc. clash with `NesRuntime.Sdk.Input.Button` and
+  `NesRuntime.Core.Region`. Disambiguate with a `using X = ...;` alias or full qualification (see
+  `Games/HelloNesGame.cs` and `MainPage.xaml.cs`).
+- SkiaSharp is **3.x**: pixel-scaled blits use `canvas.DrawImage(SKImage, dest, SKSamplingOptions)`
+  (there is no `DrawBitmap` sampling-options overload) — see `Controls/NesGameView.cs`.
+- There is **no test project yet**. When adding one, create it under `tests/` and add it with
+  `dotnet sln add`.
+- Keep the library build clean: it is expected to stay at **0 warnings**. `Directory.Build.props`
+  suppresses only `CS1591` (missing XML doc) and `CS0067` (declared-but-unraised events) because
+  both are inherent to a documented skeleton — do not suppress correctness warnings there.
+
+### Target-framework layout (important)
+
+`Directory.Build.props` deliberately does **not** set a `TargetFramework`. The three libraries pin
+`net10.0` in their own csproj; the MAUI host multi-targets platform monikers via
+`<TargetFrameworks>`, conditioned by OS — `net10.0-maccatalyst` on macOS, `net10.0-windows…` on
+Windows (so each machine builds only the target it can produce). A shared singular
+`<TargetFramework>` would collapse the host's multi-target build and break it — do not move the TFM
+back into the shared props.
+
+## Architecture
+
+Three layers, strict one-way dependency `Sdk → Rendering → Core`:
+
+- **`src/NesRuntime.Core`** — the hardware model ("what the NES can do"). Faithful subsystems:
+  `NesConsole` (composition root), CPU interrupt/timing (`Cpu2A03` — interrupt lines only, no
+  opcodes), `MemoryBus`/`IMemoryRegion`, the PPU (`Ppu2C02` and its pattern tables, nametables,
+  OAM, palettes, scroll), the APU (`Apu2A03` + five channel types), input devices, and
+  cartridge/mappers (`Cartridge`, `IMapper`, `MapperRegistry`). Game code never references this.
+- **`src/NesRuntime.Rendering`** — the host seam. A presentation host implements `IVideoBackend`,
+  `IAudioBackend`, `IInputBackend`, `IFrameClock`; `RuntimeHost` binds a `NesConsole` to them and
+  runs the frame loop. `FrameBuffer` carries 256×240 palette indices (color is resolved host-side
+  via `MasterPalette`).
+- **`src/NesRuntime.Sdk`** — the author-facing API. `NesGame` is the base class
+  (`Load`/`Update`/`Render`/`Unload`, called once per frame); it exposes `IGraphicsDevice`,
+  `IAudioDevice`, `IInputManager`, `ISaveManager`. `GameRunner.Create<TGame>(...)` boots a game
+  onto the runtime and returns a `RuntimeHost`.
+- **`hosts/NesRuntime.Maui`** — the presentation host. Implements the four rendering backends
+  (`MauiVideoBackend`→`NesGameView` SkiaSharp canvas, `MauiAudioBackend`, `MauiInputBackend` fed by
+  on-screen controls, `DispatcherFrameClock` on the UI dispatcher) and wires them to a game via
+  `GameRunner` in `MainPage`. The whole runtime loop runs on the UI thread by design, so
+  presentation/input need no cross-thread marshaling. Pressing Start runs and renders the sample
+  game; the try/catch around startup remains as a safety net for paths that are still stubbed.
+
+## Conventions that matter here
+
+- **Strict hardware authenticity is a hard requirement, not a nicety.** The SDK deliberately
+  enforces real NES limits (64 sprites total, 8 per scanline, 4+4 palettes of 3 colors from the
+  fixed 64-color system palette, 256×240 tile grid, 5 audio channels). `NesHardware` holds these
+  constants — reference them rather than hard-coding numbers, and preserve the constraints when
+  implementing stubs. Colors are `NesColor` **indices into the system palette**, never arbitrary
+  RGB.
+- **Dual-path content is intentional.** Every asset kind supports both a high-level import
+  (PNG→tiles+palette, WAV→DMC sample) and a native NES-format loader (CHR, NSF, iNES) — see
+  `IContentPipeline` and `INativeContent`. Keep both paths when extending content.
+- **The Core layer stays game-agnostic.** No game-facing convenience belongs in `NesRuntime.Core`;
+  that sugar lives in the SDK. Core models hardware; the SDK makes it pleasant.
+- **File/namespace layout:** namespaces follow folders (`NesRuntime.Core.Ppu`,
+  `NesRuntime.Sdk.Graphics`, …). One primary public type per file, with tightly-coupled small
+  types (an enum + its owner) allowed to share a file.
+- `Directory.Build.props` centralizes shared settings (net10.0, nullable, implicit usings, doc
+  generation) for every project — add cross-cutting settings there, not per-csproj.
+
+## Implemented render path (the vertical slice)
+
+A game renders real frames through this chain — everything here has real logic, not stubs:
+
+- **`Ppu2C02.RenderTo(Span<byte>)`** (Core) — the software compositor. Fills the backdrop, draws
+  the background (nametable tile indices → pattern-table pixels → attribute-table palette), then
+  sprites (OAM order = priority, transparency, H/V flip, 8×8 and 8×16, behind-background priority,
+  sprite-0 hit, and the authentic 8-sprites-per-scanline drop with the overflow flag). Outputs one
+  system-palette index per pixel. Supporting Core types (`MasterPalette` with the real 64-color
+  table, `PaletteMemory`, `PatternTable`/`Tile`, `Nametable`/`AttributeTable`,
+  `ObjectAttributeMemory`, `ScrollState`) are implemented.
+- **`FrameBuffer`** (Rendering) — holds the index buffer; `ResolveTo` converts to 0xRRGGBB via
+  `MasterPalette`.
+- **SDK software services** — `SoftwareGraphicsDevice` (+ tile set / palette set / background /
+  sprite layer) writes the game's draw calls into a `Ppu2C02`; `SoftwareInputManager`/`GamePad`
+  give edge-detected input; `SilentAudioDevice` and `MemorySaveManager` are working no-op/in-memory
+  services.
+- **Audio** — `SynthAudioDevice` (SDK) is a working stand-in synthesizer: pulse (square, with
+  duty), triangle, an LFSR noise voice, and a `SoundEffect` player (one tone step per frame). It
+  implements `IAudioDevice`, so game code (`Audio.Pulse1.PlayNote(...)`, `Audio.Play(effect)`)
+  drives it. `Note.Frequency`/`FromMidi` and `SoundEffect.FromSteps` are implemented. It is *not*
+  the register-accurate APU — that's still stubbed.
+- **Loop** — `GameRunner.Create<TGame>` builds a `Ppu2C02` + services (including `SynthAudioDevice`),
+  attaches the game, runs `Load`, and returns a `RuntimeHost` wrapping a `SoftwareRuntimeCore`
+  (implements `IRuntimeCore`). Each `StepFrame`: poll input → game Update/Render → PPU composite →
+  **synthesize this frame's audio and push it to `IAudioBackend.QueueSamples`** → present.
+  `MauiAudioBackend` plays those samples via `AVAudioEngine` on Mac Catalyst (ring buffer →
+  `AVAudioSourceNode`; `#if MACCATALYST`, no-op elsewhere). **Note the layering seam: `RuntimeHost`
+  (Rendering) is driven by the `IRuntimeCore` abstraction, not a `NesConsole`** — the SDK owns frame
+  production. `NesConsole` remains a stub for a future register-accurate path.
+
+Verify a render-path change without launching MAUI: drive `GameRunner.Create<T>` with fake
+backends, `Fire()` a manual `IFrameClock`, and inspect the returned `FrameBuffer` (that is how the
+slice was verified — resolving to RGB and writing a BMP).
+
+## Not yet present (planned)
+
+No test project exists yet. Audio works via the stand-in `SynthAudioDevice`, but the
+**register-accurate APU** (`Apu2A03` and its channel types) is still stubbed, as are cartridge/mapper
+loading, the CPU memory bus, and the register-accurate PPU path (`Ppu2C02.Read`/`Write`). Next
+steps: make the APU real; scrolling/mid-frame splits; native content import (PNG→tiles,
+CHR/NSF/iNES); Windows audio output; and a test project around the compositor and synth. The sample
+game lives at `hosts/NesRuntime.Maui/Games/HelloNesGame.cs`.

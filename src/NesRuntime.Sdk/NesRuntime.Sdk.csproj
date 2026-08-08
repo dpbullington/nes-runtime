@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>NesRuntime.Sdk</RootNamespace>
+    <AssemblyName>NesRuntime.Sdk</AssemblyName>
+    <Description>
+      The game-author-facing SDK. Write NES games in idiomatic C# — sprites, tile maps,
+      palettes, sound, input, and battery-backed saves — without touching NES assembly or
+      hardware registers. Supports both high-level authoring (import PNG/WAV) and native NES
+      formats (CHR pattern tables, NSF audio, iNES cartridges). Enforces authentic NES limits.
+    </Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NesRuntime.Core\NesRuntime.Core.csproj" />
+    <ProjectReference Include="..\NesRuntime.Rendering\NesRuntime.Rendering.csproj" />
+  </ItemGroup>
+
+</Project>

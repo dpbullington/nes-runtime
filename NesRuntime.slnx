@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/hosts/">
+    <Project Path="hosts/NesRuntime.Maui/NesRuntime.Maui.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/NesRuntime.Core/NesRuntime.Core.csproj" />
+    <Project Path="src/NesRuntime.Rendering/NesRuntime.Rendering.csproj" />
+    <Project Path="src/NesRuntime.Sdk/NesRuntime.Sdk.csproj" />
+  </Folder>
+</Solution>

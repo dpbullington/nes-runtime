@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>NesRuntime.Core</RootNamespace>
+    <AssemblyName>NesRuntime.Core</AssemblyName>
+    <Description>
+      Hardware-faithful model of the Nintendo Entertainment System (2A03 CPU core, 2C02 PPU,
+      APU, controller I/O, cartridge/mappers). This layer defines the authentic hardware
+      capabilities and constraints that the SDK abstracts. It contains no game-facing sugar.
+    </Description>
+  </PropertyGroup>
+
+</Project>

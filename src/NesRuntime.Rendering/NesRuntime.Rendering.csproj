@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>NesRuntime.Rendering</RootNamespace>
+    <AssemblyName>NesRuntime.Rendering</AssemblyName>
+    <Description>
+      Backend abstraction that decouples the runtime from any particular presentation host.
+      A host (MAUI, console, headless test, etc.) implements the video/audio/input backends and
+      the frame clock; the runtime drives them. Depends only on NesRuntime.Core primitives.
+    </Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NesRuntime.Core\NesRuntime.Core.csproj" />
+  </ItemGroup>
+
+</Project>
