@@ -48,7 +48,8 @@ public partial class MainPage : ContentPage
             var video = new MauiVideoBackend(_screen);
             var audio = new MauiAudioBackend();
             _clock = new DispatcherFrameClock(Dispatcher, NtscFps);
-            _host = GameRunner.Create<HelloNesGame>(video, audio, _input, _clock, NesRuntime.Core.Region.Ntsc);
+            // Swap the type argument to run a different game (e.g. HelloNesGame).
+            _host = GameRunner.Create<BreakoutGame>(video, audio, _input, _clock, NesRuntime.Core.Region.Ntsc);
             _host.Run();
             _running = true;
             StatusLabel.Text = "Running.";

@@ -132,6 +132,13 @@ The sample game ships an 8×8 bitmap font covering every printable ASCII charact
 
 ![Font sheet: all 95 printable ASCII glyphs rendered by the runtime](docs/font-sheet.png)
 
+The host runs **`BreakoutGame`** by default — a Breakout clone built entirely on the SDK: the brick
+wall is background tiles (destroying one is a single nametable write, so it isn't bound by the
+sprite budget), while the paddle, ball, and score/lives HUD are sprites. Move Left/Right, launch
+with A. Swap the type argument in `MainPage` (`GameRunner.Create<…>`) to run `HelloNesGame` instead.
+
+![Breakout clone: color-banded brick wall, paddle, ball, score and lives HUD](docs/breakout.png)
+
 It targets the desktop platforms: **Mac Catalyst** (built on macOS) and **Windows** (built on
 Windows). Each OS builds only the target it can produce, so the solution builds cleanly in Rider or
 `dotnet` on either without extra SDKs. **Mac Catalyst builds clean and runs on macOS today.** To
