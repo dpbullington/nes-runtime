@@ -99,10 +99,13 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   `Apu` (2A03 audio — pulse ×2/triangle/noise/DMC + frame sequencer + non-linear mixer; clocked per
   CPU cycle, emits a float sample stream via `NesMachine.CopyAudio`; the DMC reads sample bytes via a
   memory-reader callback — its DMA CPU-stall cycles are not modeled),
-  `Mapper` (NROM 0, MMC1 1, UxROM 2, CNROM 3, MMC3 4, AxROM 7; unknown mappers throw
-  `NotSupportedException`). MMC3's scanline IRQ: `IMapper.OnScanline()` (default no-op) is clocked
-  per rendered scanline and `IMapper.IrqPending` drives `Mos6502.IrqLine`, refreshed after the clock
-  and after every mapper write (so an `$E000` acknowledge clears it).
+  `Mapper` (NROM 0, MMC1 1, UxROM 2, CNROM 3, MMC3 4, AxROM 7, Color Dreams 11, GxROM 66,
+  Sunsoft FME-7 69; unknown mappers throw `NotSupportedException`). Two IRQ hooks on `IMapper`
+  (both default no-op, both drive `IMapper.IrqPending` → `Mos6502.IrqLine`): MMC3's scanline IRQ via
+  `OnScanline()` (clocked per rendered scanline), and FME-7's 16-bit CPU-cycle down-counter IRQ via
+  `OnCpuCycles(int)` (clocked in the CPU step loop). `IrqLine` is refreshed after each clock and
+  after every mapper write (so an `$E000` MMC3 acknowledge, or an FME-7 `$D` control write, clears
+  it). FME-7's 5B expansion audio is accepted but not synthesized.
   `INesRom` (iNES/NES 2.0 loader), and `NesMachine` (bus + controllers + per-frame step). The PPU
   fetches all CHR through `IMapper.ChrRead` and reads `IMapper.Mirroring` live, and the bus routes
   PRG through the mapper — so adding a (non-IRQ) mapper is just a new `IMapper` class, no PPU changes.
@@ -114,7 +117,7 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   It is scanline-accurate with the full APU and full illegal-opcode set covering ~80% of the library,
   **not** Mesen parity: no dot-accurate timing (mid-scanline raster tricks; DMC DMA stalls), the
   unstable stores (SHX/SHY/SHA/TAS/LAS) use the common "AND high-byte+1" behavior rather than being
-  bus-conflict/RDY accurate, and only the common mappers (0/1/2/3/4/7).
+  bus-conflict/RDY accurate, and only the common mappers (0/1/2/3/4/7/11/66/69).
 
 ## Conventions that matter here
 

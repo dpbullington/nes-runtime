@@ -88,7 +88,9 @@ public sealed class NesMachine : IBus
             {
                 long before = _cycles;
                 _cycles += _cpu.Step();
-                _apu.Clock((int)(_cycles - before));    // advance audio by the instruction's cycles (incl. DMA)
+                int elapsed = (int)(_cycles - before);
+                _apu.Clock(elapsed);                    // advance audio by the instruction's cycles (incl. DMA)
+                _mapper.OnCpuCycles(elapsed);           // clock any CPU-cycle mapper IRQ (FME-7)
                 RefreshIrq();
             }
 

@@ -15,9 +15,11 @@ public interface IMapper
     byte ChrRead(ushort address);      // PPU $0000-$1FFF
     void ChrWrite(ushort address, byte value);
 
-    // Scanline-counter IRQ (only MMC3-style mappers use these; others get the no-op defaults).
+    // IRQ hooks. MMC3-style mappers count rendered scanlines (OnScanline); Sunsoft FME-7-style
+    // mappers count CPU cycles (OnCpuCycles). Both drive IrqPending; unused ones get no-op defaults.
     bool IrqPending => false;
     void OnScanline() { }
+    void OnCpuCycles(int cycles) { }
 
     static IMapper Create(INesRom rom) => rom.MapperNumber switch
     {
@@ -27,8 +29,12 @@ public interface IMapper
         3 => new CnRomMapper(rom),
         4 => new Mmc3Mapper(rom),
         7 => new AxRomMapper(rom),
+        11 => new ColorDreamsMapper(rom),
+        66 => new GxRomMapper(rom),
+        69 => new Fme7Mapper(rom),
         _ => throw new NotSupportedException(
-            $"Mapper {rom.MapperNumber} is not supported yet (have: 0/NROM, 1/MMC1, 2/UxROM, 3/CNROM, 4/MMC3, 7/AxROM)."),
+            $"Mapper {rom.MapperNumber} is not supported yet " +
+            "(have: 0/NROM, 1/MMC1, 2/UxROM, 3/CNROM, 4/MMC3, 7/AxROM, 11/ColorDreams, 66/GxROM, 69/FME-7)."),
     };
 }
 
@@ -382,5 +388,206 @@ public sealed class Mmc3Mapper : IMapper
             _ => _bank[5],
         };
         return (bank1k % _chrBanks1k) * 0x400 + (address & 0x3FF);
+    }
+}
+
+/// <summary>
+/// GxROM (mapper 66): a single bank register at $8000-$FFFF selects a switchable 32 KiB PRG bank
+/// (bits 4-5) and a switchable 8 KiB CHR-ROM bank (bits 0-1). Fixed header mirroring.
+/// </summary>
+public sealed class GxRomMapper : IMapper
+{
+    private readonly byte[] _prg;
+    private readonly byte[] _chr;
+    private readonly int _prgBanks32k;
+    private readonly int _chrBanks8k;
+    private int _prgBank, _chrBank;
+
+    public GxRomMapper(INesRom rom)
+    {
+        _prg = rom.Prg;
+        _chr = rom.Chr.Length > 0 ? rom.Chr : new byte[0x2000];
+        _prgBanks32k = Math.Max(1, _prg.Length / 0x8000);
+        _chrBanks8k = Math.Max(1, _chr.Length / 0x2000);
+        Mirroring = rom.Mirroring;
+    }
+
+    public int Number => 66;
+    public Mirroring Mirroring { get; }
+
+    public byte CpuRead(ushort address) =>
+        address >= 0x8000 ? _prg[(_prgBank % _prgBanks32k) * 0x8000 + (address - 0x8000)] : (byte)0;
+
+    public void CpuWrite(ushort address, byte value)
+    {
+        if (address < 0x8000) return;
+        _prgBank = (value >> 4) & 3;
+        _chrBank = value & 3;
+    }
+
+    public byte ChrRead(ushort address) => _chr[(_chrBank % _chrBanks8k) * 0x2000 + (address & 0x1FFF)];
+    public void ChrWrite(ushort address, byte value) { } // CHR-ROM
+}
+
+/// <summary>
+/// Color Dreams (mapper 11): a single bank register at $8000-$FFFF selects a switchable 32 KiB PRG
+/// bank (low 2 bits) and a switchable 8 KiB CHR-ROM bank (high 4 bits). Fixed header mirroring.
+/// </summary>
+public sealed class ColorDreamsMapper : IMapper
+{
+    private readonly byte[] _prg;
+    private readonly byte[] _chr;
+    private readonly int _prgBanks32k;
+    private readonly int _chrBanks8k;
+    private int _prgBank, _chrBank;
+
+    public ColorDreamsMapper(INesRom rom)
+    {
+        _prg = rom.Prg;
+        _chr = rom.Chr.Length > 0 ? rom.Chr : new byte[0x2000];
+        _prgBanks32k = Math.Max(1, _prg.Length / 0x8000);
+        _chrBanks8k = Math.Max(1, _chr.Length / 0x2000);
+        Mirroring = rom.Mirroring;
+    }
+
+    public int Number => 11;
+    public Mirroring Mirroring { get; }
+
+    public byte CpuRead(ushort address) =>
+        address >= 0x8000 ? _prg[(_prgBank % _prgBanks32k) * 0x8000 + (address - 0x8000)] : (byte)0;
+
+    public void CpuWrite(ushort address, byte value)
+    {
+        if (address < 0x8000) return;
+        _prgBank = value & 3;
+        _chrBank = (value >> 4) & 0x0F;
+    }
+
+    public byte ChrRead(ushort address) => _chr[(_chrBank % _chrBanks8k) * 0x2000 + (address & 0x1FFF)];
+    public void ChrWrite(ushort address, byte value) { } // CHR-ROM
+}
+
+/// <summary>
+/// Sunsoft FME-7 (mapper 69): a command/parameter register pair drives eight 1 KiB CHR banks, four
+/// PRG slots (the $6000 slot selectable as ROM or PRG-RAM, $E000 fixed to the last bank), runtime
+/// mirroring, and a 16-bit **CPU-cycle** down-counter IRQ (clocked via <see cref="OnCpuCycles"/>).
+/// The 5B expansion-audio registers ($C000/$E000 audio) are accepted but not synthesized.
+/// </summary>
+public sealed class Fme7Mapper : IMapper
+{
+    private readonly byte[] _prg;
+    private readonly byte[] _chr;
+    private readonly bool _chrRam;
+    private readonly byte[] _prgRam = new byte[0x2000];
+    private readonly int _prgBanks8k;
+    private readonly int _chrBanks1k;
+    private readonly int[] _chrBank = new int[8];
+    private readonly int[] _prgBank = new int[4]; // slots: $6000, $8000, $A000, $C000
+
+    private int _command;
+    private bool _prgRamSelected, _prgRamEnabled;
+    private Mirroring _mirroring;
+
+    private int _irqCounter;
+    private bool _irqCountEnabled, _irqEnabled, _irqPending;
+
+    public Fme7Mapper(INesRom rom)
+    {
+        _prg = rom.Prg;
+        _chrRam = rom.ChrIsRam;
+        _chr = rom.Chr.Length > 0 ? rom.Chr : new byte[0x2000];
+        _prgBanks8k = Math.Max(1, _prg.Length / 0x2000);
+        _chrBanks1k = Math.Max(1, _chr.Length / 0x400);
+        _mirroring = rom.Mirroring;
+        _prgBank[3] = _prgBanks8k - 1; // sensible power-on default for the $C000 slot
+    }
+
+    public int Number => 69;
+    public Mirroring Mirroring => _mirroring;
+    public bool IrqPending => _irqPending;
+
+    public byte CpuRead(ushort address)
+    {
+        if (address is >= 0x6000 and < 0x8000)
+        {
+            if (_prgRamSelected)
+                return _prgRamEnabled ? _prgRam[address - 0x6000] : (byte)0;
+            return _prg[(_prgBank[0] % _prgBanks8k) * 0x2000 + (address - 0x6000)];
+        }
+        if (address < 0x8000) return 0;
+        if (address >= 0xE000) return _prg[((_prgBanks8k - 1) % _prgBanks8k) * 0x2000 + (address & 0x1FFF)];
+        int slot = ((address - 0x8000) >> 13) + 1; // $8000->1, $A000->2, $C000->3
+        return _prg[(_prgBank[slot] % _prgBanks8k) * 0x2000 + (address & 0x1FFF)];
+    }
+
+    public void CpuWrite(ushort address, byte value)
+    {
+        if (address is >= 0x6000 and < 0x8000)
+        {
+            if (_prgRamSelected && _prgRamEnabled) _prgRam[address - 0x6000] = value;
+            return;
+        }
+        if (address < 0x8000) return;
+
+        switch (address & 0xE000)
+        {
+            case 0x8000: _command = value & 0x0F; break;
+            case 0xA000: WriteParameter(value); break;
+            // $C000/$E000 select/write the 5B audio registers — accepted, not synthesized.
+        }
+    }
+
+    private void WriteParameter(byte value)
+    {
+        switch (_command)
+        {
+            case 0x0: case 0x1: case 0x2: case 0x3:
+            case 0x4: case 0x5: case 0x6: case 0x7:
+                _chrBank[_command] = value;
+                break;
+            case 0x8:
+                _prgRamSelected = (value & 0x40) != 0;
+                _prgRamEnabled = (value & 0x80) != 0;
+                _prgBank[0] = value & 0x3F;
+                break;
+            case 0x9: _prgBank[1] = value & 0x3F; break;
+            case 0xA: _prgBank[2] = value & 0x3F; break;
+            case 0xB: _prgBank[3] = value & 0x3F; break;
+            case 0xC:
+                _mirroring = (value & 3) switch
+                {
+                    0 => Mirroring.Vertical,
+                    1 => Mirroring.Horizontal,
+                    2 => Mirroring.SingleScreenLower,
+                    _ => Mirroring.SingleScreenUpper,
+                };
+                break;
+            case 0xD:
+                _irqEnabled = (value & 0x80) != 0;
+                _irqCountEnabled = (value & 0x01) != 0;
+                _irqPending = false; // writing the control register acknowledges a pending IRQ
+                break;
+            case 0xE: _irqCounter = (_irqCounter & 0xFF00) | value; break;
+            case 0xF: _irqCounter = (_irqCounter & 0x00FF) | (value << 8); break;
+        }
+    }
+
+    public void OnCpuCycles(int cycles)
+    {
+        if (!_irqCountEnabled) return;
+        for (int i = 0; i < cycles; i++)
+        {
+            if (_irqCounter == 0) { _irqCounter = 0xFFFF; if (_irqEnabled) _irqPending = true; }
+            else _irqCounter = (_irqCounter - 1) & 0xFFFF;
+        }
+    }
+
+    public byte ChrRead(ushort address) => _chr[ChrOffset(address)];
+    public void ChrWrite(ushort address, byte value) { if (_chrRam) _chr[ChrOffset(address)] = value; }
+
+    private int ChrOffset(ushort address)
+    {
+        int region = (address >> 10) & 7; // 0-7 (1 KiB regions)
+        return (_chrBank[region] % _chrBanks1k) * 0x400 + (address & 0x3FF);
     }
 }
