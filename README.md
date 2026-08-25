@@ -27,6 +27,7 @@ NesRuntime.slnx
    NesRuntime.Core/        Hardware-faithful model — the "what the NES can do" layer
    NesRuntime.Rendering/   Backend abstraction — decouples the runtime from any host
    NesRuntime.Sdk/         Game-author-facing API — the "how you write a game" layer
+   NesRuntime.Emulation/   Self-contained NES execution core — runs real iNES/NES 2.0 ROMs
  hosts/
    NesRuntime.Maui/        .NET MAUI presentation host (SkiaSharp canvas + on-screen controls)
 ```
@@ -118,7 +119,7 @@ backends and drives a game:
 |---------|----------------|
 | `IVideoBackend` | `MauiVideoBackend` → `NesGameView`, an `SKCanvasView` that blits the 256×240 framebuffer with nearest-neighbor scaling |
 | `IAudioBackend` | `MauiAudioBackend` → plays the synthesized samples via `AVAudioEngine` on Mac Catalyst (a ring buffer feeds an `AVAudioSourceNode`); no-op sink on platforms not yet wired |
-| `IInputBackend` | `MauiInputBackend`, fed by an on-screen D-pad + A/B/Select/Start |
+| `IInputBackend` | `MauiInputBackend` — merges on-screen buttons, **physical game controllers** (Apple GameController on Mac Catalyst, **Windows.Gaming.Input** on Windows; controller *N* → player *N*), and the **keyboard** on both platforms (arrows = D-pad, Z/X = B/A, Enter = Start, Right-Shift = Select). The host shows a live controller-connection status line. |
 | `IFrameClock` | `DispatcherFrameClock`, ticking the loop on the MAUI UI dispatcher at the NTSC rate |
 
 `MainPage` wires these to `HelloNesGame` via `GameRunner` and runs the loop. **Pressing Start
@@ -138,6 +139,32 @@ sprite budget), while the paddle, ball, and score/lives HUD are sprites. Move Le
 with A. Swap the type argument in `MainPage` (`GameRunner.Create<…>`) to run `HelloNesGame` instead.
 
 ![Breakout clone: color-banded brick wall, paddle, ball, score and lives HUD](docs/breakout.png)
+
+## Running real ROMs — the emulator
+
+`NesRuntime.Emulation` is a self-contained NES execution core that runs an actual iNES/NES 2.0
+cartridge: a full-official-opcode **6502 CPU** (`Mos6502`), a **scanline-accurate 2C02 PPU** (`Ppu`),
+a **2A03 APU** (`Apu`) — pulse ×2, triangle, noise, frame sequencer, non-linear mixer — mappers
+**NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3 (4), AxROM (7)** including MMC3's scanline-counter
+IRQ (`Mapper`), the iNES/NES 2.0 loader (`INesRom`), and two controllers wired together by
+`NesMachine`. `EmulatorGame` (a `NesGame` subclass) drives it one frame per engine frame, feeds it
+the engine's controllers, presents the emulated PPU output through the framebuffer hook
+(`NesGame.RenderFramebuffer`), and plays the APU's samples through the audio hook
+(`NesGame.RenderAudio` → `MauiAudioBackend`). In the host, click **"Load ROM…"** to pick an `.nes` file and run it
+(or set `EmulatorGame.RomImage` in code before launch); with neither, a built-in test ROM runs.
+Below is that test ROM booted and rendered by the core (its reset code writes a palette, fills the
+top tile rows, and enables background rendering):
+
+![Emulator running a test ROM: boxed-tile pattern the ROM's 6502 code drew](docs/emulator.png)
+
+Scope: a **scanline-accurate** core with **audio**, covering the six mappers above (**~80% of the
+library**) — CPU execution interleaves with per-scanline rendering, so scrolling, mid-frame
+**sprite-0-hit splits** and **MMC3 scanline-IRQ splits** (status bars), and per-line scroll changes
+render correctly, while the APU (pulse/triangle/noise) plays music and effects. Verified by CPU +
+mapper + scanline/sprite-0/IRQ + APU unit tests and hand-assembled test ROMs — **not** full
+[Mesen](https://github.com/nesdev-org/MesenCE/)-level parity. Not yet implemented: the **DMC**
+(sample) audio channel, **dot**-accurate PPU timing (mid-scanline raster tricks), unofficial CPU
+opcodes, and rarer mappers. Unsupported mappers report an error rather than mis-rendering.
 
 It targets the desktop platforms: **Mac Catalyst** (built on macOS) and **Windows** (built on
 Windows). Each OS builds only the target it can produce, so the solution builds cleanly in Rider or

@@ -50,6 +50,21 @@ public abstract class NesGame
     /// <summary>Called when the game is stopping — flush saves and release resources here.</summary>
     protected virtual void Unload() { }
 
+    /// <summary>
+    /// Optional escape hatch for games that produce a whole frame directly (e.g. a ROM emulator):
+    /// fill <paramref name="framebuffer"/> with 256×240 system-palette indices and return true to
+    /// present it verbatim, bypassing the tile/sprite compositor. Return false (the default) to use
+    /// the normal SDK rendering path.
+    /// </summary>
+    protected virtual bool RenderFramebuffer(Span<byte> framebuffer) => false;
+
+    /// <summary>
+    /// Audio counterpart to <see cref="RenderFramebuffer"/>: fill <paramref name="buffer"/> with this
+    /// frame's mono samples (normalized -1..1) and return true to output them directly, bypassing the
+    /// SDK synth. Return false (the default) to use the normal SDK audio path.
+    /// </summary>
+    protected virtual bool RenderAudio(Span<float> buffer) => false;
+
     // --- Runtime plumbing (called by the SDK's runtime core, not by game code). ---
 
     internal void Attach(IGraphicsDevice graphics, IAudioDevice audio, IInputManager input, ISaveManager save)
@@ -64,6 +79,8 @@ public abstract class NesGame
     internal void RunUpdate() => Update();
     internal void RunRender() => Render();
     internal void RunUnload() => Unload();
+    internal bool RunRenderFramebuffer(Span<byte> framebuffer) => RenderFramebuffer(framebuffer);
+    internal bool RunRenderAudio(Span<float> buffer) => RenderAudio(buffer);
     internal void AdvanceFrame() => _frame++;
 
     private static InvalidOperationException NotAttached()

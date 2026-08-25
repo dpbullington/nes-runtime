@@ -1,14 +1,20 @@
-﻿<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-    <!-- See https://aka.ms/maui-publish-app-store#add-entitlements for more information about adding entitlements.-->
+    <!-- See https://aka.ms/maui-publish-app-store#add-entitlements for more about entitlements. -->
     <dict>
-        <!-- App Sandbox must be enabled to distribute a MacCatalyst app through the Mac App Store. -->
+        <!-- App Sandbox (required for the Mac App Store; also gates user-selected file access). -->
         <key>com.apple.security.app-sandbox</key>
         <true/>
-        <!-- When App Sandbox is enabled, this value is required to open outgoing network connections. -->
+        <!-- Outgoing network connections (some frameworks require this under the sandbox). -->
         <key>com.apple.security.network.client</key>
+        <true/>
+        <!-- Access the file the user picks in the "Load ROM…" dialog. MAUI's picker requests a
+             read-write sandbox extension, so read-only is not sufficient. -->
+        <key>com.apple.security.files.user-selected.read-write</key>
+        <true/>
+        <!-- Access USB game controllers under the sandbox (GameController framework). -->
+        <key>com.apple.security.device.usb</key>
         <true/>
     </dict>
 </plist>
-

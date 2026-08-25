@@ -71,11 +71,46 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   `IAudioDevice`, `IInputManager`, `ISaveManager`. `GameRunner.Create<TGame>(...)` boots a game
   onto the runtime and returns a `RuntimeHost`.
 - **`hosts/NesRuntime.Maui`** — the presentation host. Implements the four rendering backends
-  (`MauiVideoBackend`→`NesGameView` SkiaSharp canvas, `MauiAudioBackend`, `MauiInputBackend` fed by
-  on-screen controls, `DispatcherFrameClock` on the UI dispatcher) and wires them to a game via
+  (`MauiVideoBackend`→`NesGameView` SkiaSharp canvas, `MauiAudioBackend`, `MauiInputBackend` which
+  merges on-screen controls + physical game controllers (Apple GameController `#if MACCATALYST`,
+  `Windows.Gaming.Input` `#elif WINDOWS`) + keyboard on both platforms (GCKeyboard on Mac,
+  `InputKeyboardSource.GetKeyStateForCurrentThread` on Windows), `DispatcherFrameClock` on the UI
+  dispatcher) and wires them to a game via
   `GameRunner` in `MainPage`. The whole runtime loop runs on the UI thread by design, so
   presentation/input need no cross-thread marshaling. Pressing Start runs and renders the sample
   game; the try/catch around startup remains as a safety net for paths that are still stubbed.
+  The host currently launches `EmulatorGame` (swap the `GameRunner.Create<…>` type arg for
+  `BreakoutGame` / `HelloNesGame`). **Controller gotcha:** older/generic USB pads expose the
+  deprecated `GCGamepad` profile, not `GCExtendedGamepad`, so `MauiInputBackend` reads both
+  (`ReadLegacyGamepad`). Never call `GCController.MicroGamepad` on such a pad — the binding
+  mis-casts (`GCGamepad`→`GCMicroGamepad`) and aborts the app; GameController reads are wrapped in
+  try/catch so a bad controller can't crash the game. **Entitlements gotcha:** the csproj wires
+  `Platforms/MacCatalyst/Entitlements.plist` via `<CodesignEntitlements>` (it is *not* auto-applied)
+  so the sandbox grants the "Load ROM…" picker file access and the USB controller access
+  (`device.usb`). Use `files.user-selected.read-**write**` — MAUI's picker requests a read-write
+  sandbox extension, so read-only fails with "couldn't issue sandbox extension …read-write". Without
+  wiring the plist at all, the picker fails with "Failed to create an FPSandboxingURLWrapper".
+- **`src/NesRuntime.Emulation`** — a self-contained NES execution core that runs real ROMs, distinct
+  from the C# authoring SDK: `Mos6502` (full official 6502 opcode set + level-triggered `IrqLine`),
+  `Ppu` (scanline-accurate 2C02 — `NesMachine.StepFrame` interleaves CPU execution with per-scanline
+  rendering via the loopy v/t/x scroll regs, so scrolling + sprite-0 splits work),
+  `Apu` (2A03 audio — pulse ×2/triangle/noise + frame sequencer + non-linear mixer; clocked per CPU
+  cycle, emits a float sample stream via `NesMachine.CopyAudio`; DMC channel not yet implemented),
+  `Mapper` (NROM 0, MMC1 1, UxROM 2, CNROM 3, MMC3 4, AxROM 7; unknown mappers throw
+  `NotSupportedException`). MMC3's scanline IRQ: `IMapper.OnScanline()` (default no-op) is clocked
+  per rendered scanline and `IMapper.IrqPending` drives `Mos6502.IrqLine`, refreshed after the clock
+  and after every mapper write (so an `$E000` acknowledge clears it).
+  `INesRom` (iNES/NES 2.0 loader), and `NesMachine` (bus + controllers + per-frame step). The PPU
+  fetches all CHR through `IMapper.ChrRead` and reads `IMapper.Mirroring` live, and the bus routes
+  PRG through the mapper — so adding a (non-IRQ) mapper is just a new `IMapper` class, no PPU changes.
+  It emits 256×240 system-palette indices. The host's `EmulatorGame : NesGame` wraps it and presents
+  via the **`NesGame.RenderFramebuffer` hook** (raw video) and the **`NesGame.RenderAudio` hook**
+  (raw float samples → `MauiAudioBackend`) — escape hatches (`SoftwareRuntimeCore` prefers them over
+  the tile/sprite compositor + SDK synth) that let a game emit whole frames + audio directly. Verified
+  by CPU + mapper + scanline/sprite-0/IRQ + APU unit tests and hand-assembled ROMs (scratchpad harness).
+  It is scanline-accurate with audio covering ~80% of the library, **not** Mesen parity: no DMC (sample)
+  channel, no dot-accurate timing (mid-scanline raster tricks), no unofficial opcodes, and only the
+  common mappers (0/1/2/3/4/7).
 
 ## Conventions that matter here
 

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>NesRuntime.Emulation</RootNamespace>
+    <AssemblyName>NesRuntime.Emulation</AssemblyName>
+    <Description>
+      A self-contained NES execution core: an iNES/NES 2.0 loader, the MOS 6502 CPU, a functional
+      (frame-based) 2C02 PPU, mappers, and controller input. It executes real ROM code and produces
+      256x240 system-palette indices, which a host presents through the NesRuntime framebuffer. This
+      is the "run an actual cartridge" path, distinct from the C# authoring SDK.
+    </Description>
+  </PropertyGroup>
+
+</Project>

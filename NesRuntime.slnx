@@ -4,6 +4,7 @@
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/NesRuntime.Core/NesRuntime.Core.csproj" />
+    <Project Path="src/NesRuntime.Emulation/NesRuntime.Emulation.csproj" />
     <Project Path="src/NesRuntime.Rendering/NesRuntime.Rendering.csproj" />
     <Project Path="src/NesRuntime.Sdk/NesRuntime.Sdk.csproj" />
   </Folder>

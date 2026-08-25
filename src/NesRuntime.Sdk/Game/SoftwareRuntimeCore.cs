@@ -38,7 +38,11 @@ internal sealed class SoftwareRuntimeCore : IRuntimeCore
         _graphics.BeginFrame();    // clear the per-frame sprite list
         _game.RunUpdate();         // game logic (may trigger sounds)
         _game.RunRender();         // game issues draw calls
-        _graphics.Render(_frame);  // PPU composites the image
+
+        // A game that produces a whole frame itself (e.g. a ROM emulator) presents it directly;
+        // otherwise the SDK tile/sprite compositor renders the frame.
+        if (!_game.RunRenderFramebuffer(_frame.Pixels))
+            _graphics.Render(_frame);
 
         PumpAudio(audio);          // synthesize this frame's samples and hand them to the host
         _game.AdvanceFrame();
@@ -51,7 +55,10 @@ internal sealed class SoftwareRuntimeCore : IRuntimeCore
         if (_audioBuffer.Length != samplesThisFrame)
             _audioBuffer = new float[samplesThisFrame];
 
-        _audioDevice.Render(_audioBuffer);
+        // A game that generates its own audio (e.g. a ROM emulator's APU) supplies it directly;
+        // otherwise the SDK synth renders this frame.
+        if (!_game.RunRenderAudio(_audioBuffer))
+            _audioDevice.Render(_audioBuffer);
         audio.QueueSamples(_audioBuffer);
     }
 }

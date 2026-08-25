@@ -52,6 +52,13 @@
 		<TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</TargetPlatformMinVersion>
 	</PropertyGroup>
 
+	<!-- Apply the App Sandbox entitlements on Mac Catalyst (incl. read access to user-selected
+	     files) so the "Load ROM…" file picker can hand the app a readable URL. Without this the
+	     picker fails with "Failed to create an FPSandboxingURLWrapper". -->
+	<PropertyGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">
+		<CodesignEntitlements>Platforms/MacCatalyst/Entitlements.plist</CodesignEntitlements>
+	</PropertyGroup>
+
 	<ItemGroup>
 		<!-- App Icon -->
 		<MauiIcon Include="Resources\AppIcon\appicon.svg" ForegroundFile="Resources\AppIcon\appiconfg.svg" Color="#512BD4" />
@@ -83,6 +90,7 @@
 		<ProjectReference Include="..\..\src\NesRuntime.Core\NesRuntime.Core.csproj" />
 		<ProjectReference Include="..\..\src\NesRuntime.Rendering\NesRuntime.Rendering.csproj" />
 		<ProjectReference Include="..\..\src\NesRuntime.Sdk\NesRuntime.Sdk.csproj" />
+		<ProjectReference Include="..\..\src\NesRuntime.Emulation\NesRuntime.Emulation.csproj" />
 	</ItemGroup>
 
 </Project>
