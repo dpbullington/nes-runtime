@@ -146,9 +146,8 @@ public sealed class Mos6502
     private void And(ushort a) { A &= Read(a); SetZN(A); }
     private void Eor(ushort a) { A ^= Read(a); SetZN(A); }
 
-    private void Adc(ushort a)
+    private void AdcValue(byte m)
     {
-        byte m = Read(a);
         int sum = A + m + (C ? 1 : 0);
         C = sum > 0xFF;
         V = (~(A ^ m) & (A ^ sum) & 0x80) != 0;
@@ -156,17 +155,29 @@ public sealed class Mos6502
         SetZN(A);
     }
 
-    private void Sbc(ushort a)
-    {
-        byte m = (byte)~Read(a);
-        int sum = A + m + (C ? 1 : 0);
-        C = sum > 0xFF;
-        V = (~(A ^ m) & (A ^ sum) & 0x80) != 0;
-        A = (byte)sum;
-        SetZN(A);
-    }
+    private void Adc(ushort a) => AdcValue(Read(a));
+    private void Sbc(ushort a) => AdcValue((byte)~Read(a));
 
     private void Cmp(byte reg, ushort a) { byte m = Read(a); int r = reg - m; C = reg >= m; SetZN((byte)r); }
+
+    // --- Unofficial ("illegal") opcode operations ---
+    private void Lax(ushort a) { byte v = Read(a); A = v; X = v; SetZN(v); }
+    private void Sax(ushort a) => Write(a, (byte)(A & X));
+    private void Dcp(ushort a) { byte v = (byte)(Read(a) - 1); Write(a, v); C = A >= v; SetZN((byte)(A - v)); }
+    private void Isc(ushort a) { byte v = (byte)(Read(a) + 1); Write(a, v); AdcValue((byte)~v); }
+    private void Slo(ushort a) { byte v = Read(a); C = (v & 0x80) != 0; v <<= 1; Write(a, v); A |= v; SetZN(A); }
+    private void Rla(ushort a) { byte v = Read(a); bool c = C; C = (v & 0x80) != 0; v = (byte)((v << 1) | (c ? 1 : 0)); Write(a, v); A &= v; SetZN(A); }
+    private void Sre(ushort a) { byte v = Read(a); C = (v & 1) != 0; v >>= 1; Write(a, v); A ^= v; SetZN(A); }
+    private void Rra(ushort a) { byte v = Read(a); bool c = C; C = (v & 1) != 0; v = (byte)((v >> 1) | (c ? 0x80 : 0)); Write(a, v); AdcValue(v); }
+    private void Anc(ushort a) { A &= Read(a); SetZN(A); C = (A & 0x80) != 0; }
+    private void Alr(ushort a) { A &= Read(a); C = (A & 1) != 0; A >>= 1; SetZN(A); }
+    private void Arr(ushort a) { A &= Read(a); A = (byte)((A >> 1) | (C ? 0x80 : 0)); SetZN(A); C = (A & 0x40) != 0; V = (((A >> 6) ^ (A >> 5)) & 1) != 0; }
+    private void Sbx(ushort a) { int t = A & X; byte m = Read(a); C = t >= m; X = (byte)(t - m); SetZN(X); }
+    // Unstable "high-byte" stores: reg AND (address high byte + 1).
+    private void Shx(ushort a) => Write(a, (byte)(X & (((a >> 8) + 1) & 0xFF)));
+    private void Shy(ushort a) => Write(a, (byte)(Y & (((a >> 8) + 1) & 0xFF)));
+    private void Sha(ushort a) => Write(a, (byte)(A & X & (((a >> 8) + 1) & 0xFF)));
+    private void Las(ushort a) { byte v = (byte)(Read(a) & S); A = v; X = v; S = v; SetZN(v); }
 
     private void Bit(ushort a) { byte m = Read(a); Z = (A & m) == 0; V = (m & 0x40) != 0; N = (m & 0x80) != 0; }
 
@@ -414,8 +425,113 @@ public sealed class Mos6502
 
             case 0xEA: _pendingCycles += 2; break; // NOP
 
+            // --- Unofficial ("illegal") opcodes ---
+
+            // Undocumented NOPs. Implied 1-byte forms.
+            case 0x1A: case 0x3A: case 0x5A: case 0x7A: case 0xDA: case 0xFA:
+                _pendingCycles += 2; break;
+            // Immediate DOP (2-byte NOP #imm).
+            case 0x80: case 0x82: case 0x89: case 0xC2: case 0xE2:
+                _pendingCycles += 2; PC++; break;
+            // Zero-page DOP.
+            case 0x04: case 0x44: case 0x64:
+                _pendingCycles += 3; Zp(); break;
+            // Zero-page,X DOP.
+            case 0x14: case 0x34: case 0x54: case 0x74: case 0xD4: case 0xF4:
+                _pendingCycles += 4; ZpX(); break;
+            // Absolute TOP (3-byte NOP).
+            case 0x0C:
+                _pendingCycles += 4; Abs(); break;
+            // Absolute,X TOP (+1 on page cross).
+            case 0x1C: case 0x3C: case 0x5C: case 0x7C: case 0xDC: case 0xFC:
+                _pendingCycles += 4; AbsX(true); break;
+
+            // LAX = LDA + LDX (load into A and X).
+            case 0xA7: _pendingCycles += 3; Lax(Zp()); break;
+            case 0xB7: _pendingCycles += 4; Lax(ZpY()); break;
+            case 0xAF: _pendingCycles += 4; Lax(Abs()); break;
+            case 0xBF: _pendingCycles += 4; Lax(AbsY(true)); break;
+            case 0xA3: _pendingCycles += 6; Lax(IndX()); break;
+            case 0xB3: _pendingCycles += 5; Lax(IndY(true)); break;
+
+            // SAX = store (A AND X).
+            case 0x87: _pendingCycles += 3; Sax(Zp()); break;
+            case 0x97: _pendingCycles += 4; Sax(ZpY()); break;
+            case 0x8F: _pendingCycles += 4; Sax(Abs()); break;
+            case 0x83: _pendingCycles += 6; Sax(IndX()); break;
+
+            // DCP = DEC then CMP.
+            case 0xC7: _pendingCycles += 5; Dcp(Zp()); break;
+            case 0xD7: _pendingCycles += 6; Dcp(ZpX()); break;
+            case 0xCF: _pendingCycles += 6; Dcp(Abs()); break;
+            case 0xDF: _pendingCycles += 7; Dcp(AbsX(false)); break;
+            case 0xDB: _pendingCycles += 7; Dcp(AbsY(false)); break;
+            case 0xC3: _pendingCycles += 8; Dcp(IndX()); break;
+            case 0xD3: _pendingCycles += 8; Dcp(IndY(false)); break;
+
+            // ISC (ISB) = INC then SBC.
+            case 0xE7: _pendingCycles += 5; Isc(Zp()); break;
+            case 0xF7: _pendingCycles += 6; Isc(ZpX()); break;
+            case 0xEF: _pendingCycles += 6; Isc(Abs()); break;
+            case 0xFF: _pendingCycles += 7; Isc(AbsX(false)); break;
+            case 0xFB: _pendingCycles += 7; Isc(AbsY(false)); break;
+            case 0xE3: _pendingCycles += 8; Isc(IndX()); break;
+            case 0xF3: _pendingCycles += 8; Isc(IndY(false)); break;
+
+            // SLO = ASL then ORA.
+            case 0x07: _pendingCycles += 5; Slo(Zp()); break;
+            case 0x17: _pendingCycles += 6; Slo(ZpX()); break;
+            case 0x0F: _pendingCycles += 6; Slo(Abs()); break;
+            case 0x1F: _pendingCycles += 7; Slo(AbsX(false)); break;
+            case 0x1B: _pendingCycles += 7; Slo(AbsY(false)); break;
+            case 0x03: _pendingCycles += 8; Slo(IndX()); break;
+            case 0x13: _pendingCycles += 8; Slo(IndY(false)); break;
+
+            // RLA = ROL then AND.
+            case 0x27: _pendingCycles += 5; Rla(Zp()); break;
+            case 0x37: _pendingCycles += 6; Rla(ZpX()); break;
+            case 0x2F: _pendingCycles += 6; Rla(Abs()); break;
+            case 0x3F: _pendingCycles += 7; Rla(AbsX(false)); break;
+            case 0x3B: _pendingCycles += 7; Rla(AbsY(false)); break;
+            case 0x23: _pendingCycles += 8; Rla(IndX()); break;
+            case 0x33: _pendingCycles += 8; Rla(IndY(false)); break;
+
+            // SRE = LSR then EOR.
+            case 0x47: _pendingCycles += 5; Sre(Zp()); break;
+            case 0x57: _pendingCycles += 6; Sre(ZpX()); break;
+            case 0x4F: _pendingCycles += 6; Sre(Abs()); break;
+            case 0x5F: _pendingCycles += 7; Sre(AbsX(false)); break;
+            case 0x5B: _pendingCycles += 7; Sre(AbsY(false)); break;
+            case 0x43: _pendingCycles += 8; Sre(IndX()); break;
+            case 0x53: _pendingCycles += 8; Sre(IndY(false)); break;
+
+            // RRA = ROR then ADC.
+            case 0x67: _pendingCycles += 5; Rra(Zp()); break;
+            case 0x77: _pendingCycles += 6; Rra(ZpX()); break;
+            case 0x6F: _pendingCycles += 6; Rra(Abs()); break;
+            case 0x7F: _pendingCycles += 7; Rra(AbsX(false)); break;
+            case 0x7B: _pendingCycles += 7; Rra(AbsY(false)); break;
+            case 0x63: _pendingCycles += 8; Rra(IndX()); break;
+            case 0x73: _pendingCycles += 8; Rra(IndY(false)); break;
+
+            // Immediate ALU combos.
+            case 0x0B: case 0x2B: _pendingCycles += 2; Anc(Imm()); break; // ANC
+            case 0x4B: _pendingCycles += 2; Alr(Imm()); break;            // ALR (ASR)
+            case 0x6B: _pendingCycles += 2; Arr(Imm()); break;            // ARR
+            case 0xCB: _pendingCycles += 2; Sbx(Imm()); break;            // SBX (AXS)
+            case 0xEB: _pendingCycles += 2; Sbc(Imm()); break;            // undocumented SBC #imm
+
+            // Unstable high-byte stores and LAS.
+            case 0x9E: _pendingCycles += 5; Shx(AbsY(false)); break;      // SHX (SXA)
+            case 0x9C: _pendingCycles += 5; Shy(AbsX(false)); break;      // SHY (SYA)
+            case 0x9F: _pendingCycles += 5; Sha(AbsY(false)); break;      // SHA (AHX) abs,Y
+            case 0x93: _pendingCycles += 6; Sha(IndY(false)); break;      // SHA (AHX) (ind),Y
+            case 0x9B: _pendingCycles += 5; S = (byte)(A & X); Sha(AbsY(false)); break; // TAS (SHS)
+            case 0xBB: _pendingCycles += 4; Las(AbsY(true)); break;       // LAS (LAR)
+
+            // JAM/KIL (0x02, 0x12, ...) and truly unknown bytes: treat as a 2-cycle no-op so
+            // execution continues rather than halting the CPU.
             default:
-                // Unofficial opcode: consume a conservative 2 cycles and continue (treated as NOP).
                 _pendingCycles += 2;
                 break;
         }

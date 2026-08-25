@@ -34,6 +34,7 @@ public sealed class Apu
     private readonly Pulse _pulse2 = new(onesComplement: false);
     private readonly Triangle _triangle = new();
     private readonly Noise _noise = new();
+    private readonly Dmc _dmc;
 
     private int _cycle;
     private int _frameCycle;
@@ -45,13 +46,16 @@ public sealed class Apu
     private int _count;
     private float _hpPrevIn, _hpPrevOut;
 
-    public Apu(int sampleRate)
+    /// <summary>Creates the APU. <paramref name="readMemory"/> reads CPU-space bytes for the DMC's sample DMA.</summary>
+    public Apu(int sampleRate, Func<ushort, byte> readMemory)
     {
         _cyclesPerSample = CpuHz / sampleRate;
         _buffer = new float[sampleRate]; // up to 1 second
+        _dmc = new Dmc(readMemory);
     }
 
-    public bool FrameIrqPending => _frameIrq;
+    /// <summary>The frame-counter IRQ or the DMC IRQ is asserted.</summary>
+    public bool IrqPending => _frameIrq || _dmc.IrqPending;
 
     /// <summary>Resets the per-frame sample buffer. Call at the start of each frame.</summary>
     public void BeginFrame() => _count = 0;
@@ -78,6 +82,7 @@ public sealed class Apu
     private void ClockCycle()
     {
         _triangle.ClockTimer();                       // triangle: every CPU cycle
+        _dmc.ClockTimer();                            // DMC: every CPU cycle
         if ((_cycle & 1) == 0)                         // pulses + noise: every APU cycle (2 CPU)
         {
             _pulse1.ClockTimer();
@@ -150,9 +155,10 @@ public sealed class Apu
     private float Mix()
     {
         int p1 = _pulse1.Output(), p2 = _pulse2.Output();
-        int t = _triangle.Output(), n = _noise.Output();
+        int t = _triangle.Output(), n = _noise.Output(), d = _dmc.Output();
         double pulse = (p1 + p2) == 0 ? 0 : 95.88 / (8128.0 / (p1 + p2) + 100);
-        double tnd = (t == 0 && n == 0) ? 0 : 159.79 / (1.0 / (t / 8227.0 + n / 12241.0) + 100);
+        double tnd = (t == 0 && n == 0 && d == 0) ? 0
+            : 159.79 / (1.0 / (t / 8227.0 + n / 12241.0 + d / 22638.0) + 100);
         return (float)(pulse + tnd);
     }
 
@@ -174,11 +180,17 @@ public sealed class Apu
             case 0x400C: _noise.Write0(value); break;
             case 0x400E: _noise.Write2(value); break;
             case 0x400F: _noise.Write3(value); break;
+            case 0x4010: _dmc.Write0(value); break;
+            case 0x4011: _dmc.Write1(value); break;
+            case 0x4012: _dmc.Write2(value); break;
+            case 0x4013: _dmc.Write3(value); break;
             case 0x4015:
                 _pulse1.SetEnabled((value & 1) != 0);
                 _pulse2.SetEnabled((value & 2) != 0);
                 _triangle.SetEnabled((value & 4) != 0);
                 _noise.SetEnabled((value & 8) != 0);
+                _dmc.SetEnabled((value & 0x10) != 0);
+                _dmc.IrqPending = false; // writing $4015 clears the DMC interrupt flag
                 break;
             case 0x4017:
                 _mode5 = (value & 0x80) != 0;
@@ -197,8 +209,10 @@ public sealed class Apu
         if (_pulse2.LengthNonZero) s |= 0x02;
         if (_triangle.LengthNonZero) s |= 0x04;
         if (_noise.LengthNonZero) s |= 0x08;
+        if (_dmc.Active) s |= 0x10;
         if (_frameIrq) s |= 0x40;
-        _frameIrq = false; // reading $4015 clears the frame IRQ
+        if (_dmc.IrqPending) s |= 0x80;
+        _frameIrq = false; // reading $4015 clears the frame IRQ (not the DMC IRQ)
         return s;
     }
 
@@ -334,6 +348,78 @@ public sealed class Apu
         {
             if (!_enabled || _length == 0 || (_shift & 1) != 0) return 0;
             return _constVol ? _volume : _envDecay;
+        }
+    }
+
+    /// <summary>
+    /// Delta Modulation Channel: plays 1-bit delta-encoded PCM fetched from PRG memory via DMA. The
+    /// output level moves ±2 per bit. Can loop and raise an IRQ when a non-looping sample finishes.
+    /// (The DMA's CPU-stall cycles are not modeled — a scanline-accuracy omission, not an audio one.)
+    /// </summary>
+    private sealed class Dmc(Func<ushort, byte> read)
+    {
+        private static readonly int[] RateTable =
+            [428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54];
+
+        private bool _irqEnabled, _loop;
+        private int _rate = 428, _timer = 428, _output;
+        private ushort _sampleAddr = 0xC000, _curAddr;
+        private int _sampleLen = 1, _bytesRemaining;
+        private int _shift, _bitsRemaining = 8;
+        private bool _bufferEmpty = true, _silence = true;
+        private byte _sampleBuffer;
+
+        public bool IrqPending;
+        public bool Active => _bytesRemaining > 0;
+        public int Output() => _output; // 0-127
+
+        public void Write0(byte v)
+        {
+            _irqEnabled = (v & 0x80) != 0;
+            _loop = (v & 0x40) != 0;
+            _rate = RateTable[v & 0x0F];
+            if (!_irqEnabled) IrqPending = false;
+        }
+        public void Write1(byte v) => _output = v & 0x7F;
+        public void Write2(byte v) => _sampleAddr = (ushort)(0xC000 + v * 64);
+        public void Write3(byte v) => _sampleLen = v * 16 + 1;
+
+        public void SetEnabled(bool on)
+        {
+            if (!on) _bytesRemaining = 0;
+            else if (_bytesRemaining == 0) { _curAddr = _sampleAddr; _bytesRemaining = _sampleLen; }
+        }
+
+        public void ClockTimer()
+        {
+            // Refill the sample buffer from memory when empty (the DMA, minus its stall cycles).
+            if (_bufferEmpty && _bytesRemaining > 0)
+            {
+                _sampleBuffer = read(_curAddr);
+                _bufferEmpty = false;
+                _curAddr = _curAddr == 0xFFFF ? (ushort)0x8000 : (ushort)(_curAddr + 1);
+                if (--_bytesRemaining == 0)
+                {
+                    if (_loop) { _curAddr = _sampleAddr; _bytesRemaining = _sampleLen; }
+                    else if (_irqEnabled) IrqPending = true;
+                }
+            }
+
+            if (--_timer > 0) return;
+            _timer = _rate;
+
+            if (!_silence)
+            {
+                if ((_shift & 1) != 0) { if (_output <= 125) _output += 2; }
+                else { if (_output >= 2) _output -= 2; }
+            }
+            _shift >>= 1;
+            if (--_bitsRemaining == 0)
+            {
+                _bitsRemaining = 8;
+                if (_bufferEmpty) { _silence = true; }
+                else { _silence = false; _shift = _sampleBuffer; _bufferEmpty = true; }
+            }
         }
     }
 }

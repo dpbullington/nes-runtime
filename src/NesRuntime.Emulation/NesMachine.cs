@@ -32,7 +32,7 @@ public sealed class NesMachine : IBus
     {
         _mapper = IMapper.Create(rom);
         _ppu = new Ppu(_mapper);
-        _apu = new Apu(sampleRate);
+        _apu = new Apu(sampleRate, Read); // Read supplies the DMC's sample DMA
         _cpu = new Mos6502(this);
         _cpu.Reset();
     }
@@ -42,7 +42,7 @@ public sealed class NesMachine : IBus
     /// <summary>Copies this frame's synthesized audio into <paramref name="dest"/> (padded to fit).</summary>
     public void CopyAudio(Span<float> dest) => _apu.CopyAudio(dest);
 
-    private void RefreshIrq() => _cpu.IrqLine = _mapper.IrqPending || _apu.FrameIrqPending;
+    private void RefreshIrq() => _cpu.IrqLine = _mapper.IrqPending || _apu.IrqPending;
 
     /// <summary>Sets the held buttons for a controller (0 or 1) before the next frame.</summary>
     public void SetButtons(int player, NesButton buttons)

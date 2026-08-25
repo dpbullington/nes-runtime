@@ -91,11 +91,14 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   sandbox extension, so read-only fails with "couldn't issue sandbox extension …read-write". Without
   wiring the plist at all, the picker fails with "Failed to create an FPSandboxingURLWrapper".
 - **`src/NesRuntime.Emulation`** — a self-contained NES execution core that runs real ROMs, distinct
-  from the C# authoring SDK: `Mos6502` (full official 6502 opcode set + level-triggered `IrqLine`),
+  from the C# authoring SDK: `Mos6502` (full official **and** unofficial/illegal 6502 opcode set —
+  LAX/SAX/DCP/ISC/SLO/RLA/SRE/RRA/ANC/ALR/ARR/SBX/undocumented NOPs + unstable stores — plus a
+  level-triggered `IrqLine`),
   `Ppu` (scanline-accurate 2C02 — `NesMachine.StepFrame` interleaves CPU execution with per-scanline
   rendering via the loopy v/t/x scroll regs, so scrolling + sprite-0 splits work),
-  `Apu` (2A03 audio — pulse ×2/triangle/noise + frame sequencer + non-linear mixer; clocked per CPU
-  cycle, emits a float sample stream via `NesMachine.CopyAudio`; DMC channel not yet implemented),
+  `Apu` (2A03 audio — pulse ×2/triangle/noise/DMC + frame sequencer + non-linear mixer; clocked per
+  CPU cycle, emits a float sample stream via `NesMachine.CopyAudio`; the DMC reads sample bytes via a
+  memory-reader callback — its DMA CPU-stall cycles are not modeled),
   `Mapper` (NROM 0, MMC1 1, UxROM 2, CNROM 3, MMC3 4, AxROM 7; unknown mappers throw
   `NotSupportedException`). MMC3's scanline IRQ: `IMapper.OnScanline()` (default no-op) is clocked
   per rendered scanline and `IMapper.IrqPending` drives `Mos6502.IrqLine`, refreshed after the clock
@@ -108,9 +111,10 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   (raw float samples → `MauiAudioBackend`) — escape hatches (`SoftwareRuntimeCore` prefers them over
   the tile/sprite compositor + SDK synth) that let a game emit whole frames + audio directly. Verified
   by CPU + mapper + scanline/sprite-0/IRQ + APU unit tests and hand-assembled ROMs (scratchpad harness).
-  It is scanline-accurate with audio covering ~80% of the library, **not** Mesen parity: no DMC (sample)
-  channel, no dot-accurate timing (mid-scanline raster tricks), no unofficial opcodes, and only the
-  common mappers (0/1/2/3/4/7).
+  It is scanline-accurate with the full APU and full illegal-opcode set covering ~80% of the library,
+  **not** Mesen parity: no dot-accurate timing (mid-scanline raster tricks; DMC DMA stalls), the
+  unstable stores (SHX/SHY/SHA/TAS/LAS) use the common "AND high-byte+1" behavior rather than being
+  bus-conflict/RDY accurate, and only the common mappers (0/1/2/3/4/7).
 
 ## Conventions that matter here
 

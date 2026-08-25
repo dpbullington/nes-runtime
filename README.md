@@ -144,7 +144,7 @@ with A. Swap the type argument in `MainPage` (`GameRunner.Create<…>`) to run `
 
 `NesRuntime.Emulation` is a self-contained NES execution core that runs an actual iNES/NES 2.0
 cartridge: a full-official-opcode **6502 CPU** (`Mos6502`), a **scanline-accurate 2C02 PPU** (`Ppu`),
-a **2A03 APU** (`Apu`) — pulse ×2, triangle, noise, frame sequencer, non-linear mixer — mappers
+a **2A03 APU** (`Apu`) — pulse ×2, triangle, noise, DMC, frame sequencer, non-linear mixer — mappers
 **NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3 (4), AxROM (7)** including MMC3's scanline-counter
 IRQ (`Mapper`), the iNES/NES 2.0 loader (`INesRom`), and two controllers wired together by
 `NesMachine`. `EmulatorGame` (a `NesGame` subclass) drives it one frame per engine frame, feeds it
@@ -160,11 +160,12 @@ top tile rows, and enables background rendering):
 Scope: a **scanline-accurate** core with **audio**, covering the six mappers above (**~80% of the
 library**) — CPU execution interleaves with per-scanline rendering, so scrolling, mid-frame
 **sprite-0-hit splits** and **MMC3 scanline-IRQ splits** (status bars), and per-line scroll changes
-render correctly, while the APU (pulse/triangle/noise) plays music and effects. Verified by CPU +
-mapper + scanline/sprite-0/IRQ + APU unit tests and hand-assembled test ROMs — **not** full
-[Mesen](https://github.com/nesdev-org/MesenCE/)-level parity. Not yet implemented: the **DMC**
-(sample) audio channel, **dot**-accurate PPU timing (mid-scanline raster tricks), unofficial CPU
-opcodes, and rarer mappers. Unsupported mappers report an error rather than mis-rendering.
+render correctly, while the **full APU** (pulse/triangle/noise/DMC) plays music, effects, and drum
+samples. Verified by CPU + mapper + scanline/sprite-0/IRQ + APU/DMC unit tests and hand-assembled
+test ROMs — **not** full [Mesen](https://github.com/nesdev-org/MesenCE/)-level parity. Not yet
+implemented: **dot**-accurate PPU/DMC timing (mid-scanline raster tricks; the DMC's DMA CPU-stall
+cycles), unofficial CPU opcodes, and rarer mappers. Unsupported mappers report an error rather than
+mis-rendering.
 
 It targets the desktop platforms: **Mac Catalyst** (built on macOS) and **Windows** (built on
 Windows). Each OS builds only the target it can produce, so the solution builds cleanly in Rider or
