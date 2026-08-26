@@ -8,9 +8,11 @@ namespace NesRuntime.Emulation;
 /// so mid-frame scroll changes and sprite-0-hit timing (status-bar splits) come out right.
 /// </summary>
 /// <remarks>
-/// Scanline-accurate, not dot-accurate: a register write lands at scanline granularity rather than
-/// at the exact dot. That handles the vast majority of games; the remaining edge cases (mid-scanline
-/// splits, precise sprite-0 dot) would need a dot-level PPU.
+/// Scanline-accurate rendering with dot-accurate sprite-0 timing: a register write that changes the
+/// picture lands at scanline granularity (so mid-scanline raster splits are approximate), but the
+/// sprite-0 hit flag is revealed at the exact overlap dot — <see cref="RenderScanline"/> records the
+/// dot and the machine drives <see cref="AdvanceSprite0"/> as the CPU advances, so status-bar splits
+/// that poll $2002 land correctly. True mid-scanline effects would still need a dot-level renderer.
 /// </remarks>
 public sealed class Ppu
 {
@@ -30,6 +32,11 @@ public sealed class Ppu
     public bool VBlank { get; private set; }
     public bool Sprite0Hit { get; private set; }
     public bool SpriteOverflow { get; private set; }
+
+    // The pixel (0-255) at which sprite 0 overlaps the background on the current scanline, or a large
+    // sentinel if it never does. The machine reveals Sprite0Hit only once the CPU reaches this dot,
+    // so a game polling $2002 sees the hit at the right cycle (dot-accurate status-bar splits).
+    private int _s0Dot = int.MaxValue;
 
     public Ppu(IMapper mapper) => _mapper = mapper;
 
@@ -194,9 +201,20 @@ public sealed class Ppu
         byte backdrop = Palette(0);
         fb.Slice(rowBase, Width).Fill(backdrop);
         Array.Clear(_bgLine, 0, Width);
+        _s0Dot = int.MaxValue; // no sprite-0 overlap known for this line yet
 
         if (ShowBg) RenderBackgroundLine(fb, rowBase);
         if (ShowSprites) RenderSpriteLine(scanline, fb, rowBase);
+    }
+
+    /// <summary>
+    /// Reveals the sprite-0 hit once the CPU has advanced to <paramref name="dot"/> within the current
+    /// scanline (0-340). Called repeatedly by the machine as it steps the line's CPU cycles so the
+    /// $2002 flag flips at the hardware dot rather than at the start of the line.
+    /// </summary>
+    public void AdvanceSprite0(int dot)
+    {
+        if (!Sprite0Hit && dot >= _s0Dot) Sprite0Hit = true;
     }
 
     private void RenderBackgroundLine(Span<byte> fb, int rowBase)
@@ -275,8 +293,8 @@ public sealed class Ppu
                           | (((_mapper.ChrRead((ushort)(chr + 8)) >> bit) & 1) << 1);
                 if (value == 0) continue;
 
-                if (i == 0 && _bgLine[x] && x != 255)
-                    Sprite0Hit = true;
+                if (i == 0 && _bgLine[x] && x != 255 && x + 1 < _s0Dot)
+                    _s0Dot = x + 1; // record the dot; the machine reveals the flag when the CPU reaches it
 
                 if (!(behind && _bgLine[x]))
                     fb[rowBase + x] = Palette(0x10 + (attr & 3) * 4 + value);

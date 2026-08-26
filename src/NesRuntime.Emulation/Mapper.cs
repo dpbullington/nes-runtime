@@ -29,12 +29,17 @@ public interface IMapper
         3 => new CnRomMapper(rom),
         4 => new Mmc3Mapper(rom),
         7 => new AxRomMapper(rom),
+        9 => new Mmc2Mapper(rom),
+        10 => new Mmc4Mapper(rom),
         11 => new ColorDreamsMapper(rom),
+        21 or 22 or 23 or 25 => new Vrc24Mapper(rom),
+        24 or 26 => new Vrc6Mapper(rom),
         66 => new GxRomMapper(rom),
         69 => new Fme7Mapper(rom),
         _ => throw new NotSupportedException(
             $"Mapper {rom.MapperNumber} is not supported yet " +
-            "(have: 0/NROM, 1/MMC1, 2/UxROM, 3/CNROM, 4/MMC3, 7/AxROM, 11/ColorDreams, 66/GxROM, 69/FME-7)."),
+            "(have: 0/NROM, 1/MMC1, 2/UxROM, 3/CNROM, 4/MMC3, 7/AxROM, 9/MMC2, 10/MMC4, " +
+            "11/ColorDreams, 21-26/Konami VRC2·VRC4·VRC6, 66/GxROM, 69/FME-7)."),
     };
 }
 
@@ -590,4 +595,437 @@ public sealed class Fme7Mapper : IMapper
         int region = (address >> 10) & 7; // 0-7 (1 KiB regions)
         return (_chrBank[region] % _chrBanks1k) * 0x400 + (address & 0x3FF);
     }
+}
+
+/// <summary>
+/// MMC2 (mapper 9, PxROM — Punch-Out!!): one switchable 8 KiB PRG bank at $8000 with the last three
+/// 8 KiB banks fixed, and two 4 KiB CHR banks each chosen by a **fetch latch**. The latch for a
+/// pattern table flips to "FD" or "FE" when the PPU fetches tile $FD/$FE from that table, letting the
+/// board swap CHR mid-screen (the boxing-ring split) without CPU involvement.
+/// </summary>
+public sealed class Mmc2Mapper : IMapper
+{
+    private readonly byte[] _prg;
+    private readonly byte[] _chr;
+    private readonly int _prgBanks8k;
+    private readonly int _chrBanks4k;
+    private int _prgBank;
+    private int _chrFD0, _chrFE0, _chrFD1, _chrFE1; // CHR banks selected by each latch state
+    private bool _latch0FE, _latch1FE;               // false = FD, true = FE
+    private Mirroring _mirroring;
+
+    public Mmc2Mapper(INesRom rom)
+    {
+        _prg = rom.Prg;
+        _chr = rom.Chr.Length > 0 ? rom.Chr : new byte[0x2000];
+        _prgBanks8k = Math.Max(1, _prg.Length / 0x2000);
+        _chrBanks4k = Math.Max(1, _chr.Length / 0x1000);
+        _mirroring = rom.Mirroring;
+    }
+
+    public int Number => 9;
+    public Mirroring Mirroring => _mirroring;
+
+    public byte CpuRead(ushort address)
+    {
+        if (address < 0x8000) return 0;
+        int bank = (address & 0x6000) switch
+        {
+            0x0000 => _prgBank,             // $8000-$9FFF switchable
+            0x2000 => _prgBanks8k - 3,      // $A000-$BFFF fixed
+            0x4000 => _prgBanks8k - 2,      // $C000-$DFFF fixed
+            _ => _prgBanks8k - 1,           // $E000-$FFFF fixed
+        };
+        return _prg[(bank % _prgBanks8k) * 0x2000 + (address & 0x1FFF)];
+    }
+
+    public void CpuWrite(ushort address, byte value)
+    {
+        switch (address & 0xF000)
+        {
+            case 0xA000: _prgBank = value & 0x0F; break;
+            case 0xB000: _chrFD0 = value & 0x1F; break;
+            case 0xC000: _chrFE0 = value & 0x1F; break;
+            case 0xD000: _chrFD1 = value & 0x1F; break;
+            case 0xE000: _chrFE1 = value & 0x1F; break;
+            case 0xF000: _mirroring = (value & 1) == 0 ? Mirroring.Vertical : Mirroring.Horizontal; break;
+        }
+    }
+
+    public byte ChrRead(ushort address)
+    {
+        byte b = _chr[ChrOffset(address)];
+        UpdateLatch(address); // the latch flips *after* the triggering tile is fetched
+        return b;
+    }
+
+    public void ChrWrite(ushort address, byte value) { } // CHR-ROM
+
+    private int ChrOffset(ushort address)
+    {
+        int bank = address < 0x1000
+            ? (_latch0FE ? _chrFE0 : _chrFD0)
+            : (_latch1FE ? _chrFE1 : _chrFD1);
+        return (bank % _chrBanks4k) * 0x1000 + (address & 0x0FFF);
+    }
+
+    private void UpdateLatch(ushort address)
+    {
+        switch (address & 0x1FF8)
+        {
+            case 0x0FD8: _latch0FE = false; break;
+            case 0x0FE8: _latch0FE = true; break;
+            case 0x1FD8: _latch1FE = false; break;
+            case 0x1FE8: _latch1FE = true; break;
+        }
+    }
+}
+
+/// <summary>
+/// MMC4 (mapper 10, FxROM — Fire Emblem, Famicom Wars): the same fetch-latch CHR banking as MMC2,
+/// but PRG is a switchable 16 KiB bank at $8000-$BFFF with the last 16 KiB fixed at $C000, plus
+/// 8 KiB PRG-RAM at $6000.
+/// </summary>
+public sealed class Mmc4Mapper : IMapper
+{
+    private readonly byte[] _prg;
+    private readonly byte[] _chr;
+    private readonly byte[] _prgRam = new byte[0x2000];
+    private readonly int _prgBanks16k;
+    private readonly int _chrBanks4k;
+    private int _prgBank;
+    private int _chrFD0, _chrFE0, _chrFD1, _chrFE1;
+    private bool _latch0FE, _latch1FE;
+    private Mirroring _mirroring;
+
+    public Mmc4Mapper(INesRom rom)
+    {
+        _prg = rom.Prg;
+        _chr = rom.Chr.Length > 0 ? rom.Chr : new byte[0x2000];
+        _prgBanks16k = Math.Max(1, _prg.Length / 0x4000);
+        _chrBanks4k = Math.Max(1, _chr.Length / 0x1000);
+        _mirroring = rom.Mirroring;
+    }
+
+    public int Number => 10;
+    public Mirroring Mirroring => _mirroring;
+
+    public byte CpuRead(ushort address)
+    {
+        if (address is >= 0x6000 and < 0x8000) return _prgRam[address - 0x6000];
+        if (address < 0x8000) return 0;
+        int bank = address < 0xC000 ? _prgBank : _prgBanks16k - 1; // switchable $8000, fixed last $C000
+        return _prg[(bank % _prgBanks16k) * 0x4000 + (address & 0x3FFF)];
+    }
+
+    public void CpuWrite(ushort address, byte value)
+    {
+        if (address is >= 0x6000 and < 0x8000) { _prgRam[address - 0x6000] = value; return; }
+        switch (address & 0xF000)
+        {
+            case 0xA000: _prgBank = value & 0x0F; break;
+            case 0xB000: _chrFD0 = value & 0x1F; break;
+            case 0xC000: _chrFE0 = value & 0x1F; break;
+            case 0xD000: _chrFD1 = value & 0x1F; break;
+            case 0xE000: _chrFE1 = value & 0x1F; break;
+            case 0xF000: _mirroring = (value & 1) == 0 ? Mirroring.Vertical : Mirroring.Horizontal; break;
+        }
+    }
+
+    public byte ChrRead(ushort address)
+    {
+        byte b = _chr[ChrOffset(address)];
+        UpdateLatch(address);
+        return b;
+    }
+
+    public void ChrWrite(ushort address, byte value) { } // CHR-ROM
+
+    private int ChrOffset(ushort address)
+    {
+        int bank = address < 0x1000
+            ? (_latch0FE ? _chrFE0 : _chrFD0)
+            : (_latch1FE ? _chrFE1 : _chrFD1);
+        return (bank % _chrBanks4k) * 0x1000 + (address & 0x0FFF);
+    }
+
+    private void UpdateLatch(ushort address)
+    {
+        switch (address & 0x1FF8)
+        {
+            case 0x0FD8: _latch0FE = false; break;
+            case 0x0FE8: _latch0FE = true; break;
+            case 0x1FD8: _latch1FE = false; break;
+            case 0x1FE8: _latch1FE = true; break;
+        }
+    }
+}
+
+/// <summary>
+/// The Konami VRC IRQ shared by VRC4 and VRC6. An 8-bit counter is reloaded from a latch and, on
+/// overflow ($FF → reload), asserts an IRQ. In scanline mode a prescaler subtracts 3 CPU cycles from
+/// 341 (the 114/114/113 sequence, ~one clock per scanline); in cycle mode the counter clocks every
+/// CPU cycle. Writing control acknowledges + reloads; writing acknowledge clears the flag and copies
+/// the "enable after acknowledge" bit back into enable.
+/// </summary>
+internal sealed class VrcIrq
+{
+    private byte _latch, _counter;
+    private int _prescaler = 341;
+    private bool _enabled, _enableAfterAck, _cycleMode;
+
+    public bool Pending { get; private set; }
+
+    public void WriteLatch8(byte v) => _latch = v;                                  // VRC6: one write
+    public void WriteLatchLow(byte v) => _latch = (byte)((_latch & 0xF0) | (v & 0x0F));  // VRC4: nibble pair
+    public void WriteLatchHigh(byte v) => _latch = (byte)((_latch & 0x0F) | ((v & 0x0F) << 4));
+
+    public void WriteControl(byte v)
+    {
+        _enableAfterAck = (v & 1) != 0;
+        _enabled = (v & 2) != 0;
+        _cycleMode = (v & 4) != 0;
+        Pending = false;                       // control write acknowledges
+        if (_enabled) { _counter = _latch; _prescaler = 341; }
+    }
+
+    public void Acknowledge()
+    {
+        Pending = false;
+        _enabled = _enableAfterAck;             // restore enable from the "after ack" bit
+    }
+
+    public void Clock(int cpuCycles)
+    {
+        if (!_enabled) return;
+        for (int i = 0; i < cpuCycles; i++)
+        {
+            if (_cycleMode) { ClockCounter(); continue; }
+            _prescaler -= 3;
+            if (_prescaler <= 0) { _prescaler += 341; ClockCounter(); }
+        }
+    }
+
+    private void ClockCounter()
+    {
+        if (_counter == 0xFF) { _counter = _latch; Pending = true; }
+        else _counter++;
+    }
+}
+
+/// <summary>
+/// Konami VRC6 (mappers 24 and 26 — Castlevania III / Akumajou Densetsu). A 16 KiB switchable PRG
+/// bank at $8000, an 8 KiB bank at $C000, the last 8 KiB fixed at $E000; eight 1 KiB CHR banks;
+/// runtime mirroring from $B003; and the shared <see cref="VrcIrq"/>. The 6b variant (26) swaps the
+/// A0/A1 register-select lines. VRC6 expansion audio is accepted (register writes ignored), not
+/// synthesized, and only CHR banking mode 0 (eight 1 KiB banks) is modeled.
+/// </summary>
+public sealed class Vrc6Mapper : IMapper
+{
+    private readonly byte[] _prg;
+    private readonly byte[] _chr;
+    private readonly bool _chrRam;
+    private readonly byte[] _prgRam = new byte[0x2000];
+    private readonly int _prgBanks16k, _prgBanks8k, _chrBanks1k;
+    private readonly int _number;
+    private readonly int[] _chrReg = new int[8];
+    private readonly VrcIrq _irq = new();
+
+    private int _prg16, _prg8;
+    private Mirroring _mirroring;
+
+    public Vrc6Mapper(INesRom rom)
+    {
+        _number = rom.MapperNumber;
+        _prg = rom.Prg;
+        _chrRam = rom.ChrIsRam;
+        _chr = rom.Chr.Length > 0 ? rom.Chr : new byte[0x2000];
+        _prgBanks16k = Math.Max(1, _prg.Length / 0x4000);
+        _prgBanks8k = Math.Max(1, _prg.Length / 0x2000);
+        _chrBanks1k = Math.Max(1, _chr.Length / 0x400);
+        _mirroring = rom.Mirroring;
+    }
+
+    public int Number => _number;
+    public Mirroring Mirroring => _mirroring;
+    public bool IrqPending => _irq.Pending;
+
+    // A0/A1 register-select bits — swapped on VRC6b (mapper 26).
+    private int Sub(ushort a) => _number == 26
+        ? ((a & 1) << 1) | ((a >> 1) & 1)
+        : a & 3;
+
+    public byte CpuRead(ushort address)
+    {
+        if (address is >= 0x6000 and < 0x8000) return _prgRam[address - 0x6000];
+        if (address < 0x8000) return 0;
+        if (address < 0xC000) return _prg[(_prg16 % _prgBanks16k) * 0x4000 + (address & 0x3FFF)];
+        if (address < 0xE000) return _prg[(_prg8 % _prgBanks8k) * 0x2000 + (address & 0x1FFF)];
+        return _prg[((_prgBanks8k - 1) % _prgBanks8k) * 0x2000 + (address & 0x1FFF)];
+    }
+
+    public void CpuWrite(ushort address, byte value)
+    {
+        if (address is >= 0x6000 and < 0x8000) { _prgRam[address - 0x6000] = value; return; }
+        if (address < 0x8000) return;
+
+        int sub = Sub(address);
+        switch (address & 0xF000)
+        {
+            case 0x8000: _prg16 = value & 0x0F; break;
+            case 0xB000: if (sub == 3) _mirroring = MirrorOf(value); break;
+            case 0xC000: _prg8 = value & 0x1F; break;
+            case 0xD000: _chrReg[sub] = value; break;      // R0-R3
+            case 0xE000: _chrReg[4 + sub] = value; break;  // R4-R7
+            case 0xF000:
+                switch (sub)
+                {
+                    case 0: _irq.WriteLatch8(value); break;
+                    case 1: _irq.WriteControl(value); break;
+                    case 2: _irq.Acknowledge(); break;
+                }
+                break;
+            // $9000/$A000: expansion-audio registers — accepted, not synthesized.
+        }
+    }
+
+    public void OnCpuCycles(int cycles) => _irq.Clock(cycles);
+
+    public byte ChrRead(ushort address) => _chr[ChrOffset(address)];
+    public void ChrWrite(ushort address, byte value) { if (_chrRam) _chr[ChrOffset(address)] = value; }
+
+    private int ChrOffset(ushort address)
+    {
+        int region = (address >> 10) & 7;
+        return (_chrReg[region] % _chrBanks1k) * 0x400 + (address & 0x3FF);
+    }
+
+    private static Mirroring MirrorOf(byte v) => ((v >> 2) & 3) switch
+    {
+        0 => Mirroring.Vertical,
+        1 => Mirroring.Horizontal,
+        2 => Mirroring.SingleScreenLower,
+        _ => Mirroring.SingleScreenUpper,
+    };
+}
+
+/// <summary>
+/// Konami VRC2/VRC4 (mappers 21, 22, 23, 25 — Gradius, Contra, TMNT, Wai Wai World, …). Two 8 KiB
+/// switchable PRG banks with a swap-mode bit, eight 1 KiB CHR banks written as low-nibble/high-bits
+/// pairs, runtime mirroring, and (VRC4 only) the shared <see cref="VrcIrq"/>. The board variants wire
+/// different CPU address lines to the register's two select bits; because iNES 1.0 lacks submapper
+/// info, the select bits are decoded by OR-ing every candidate line for the mapper number — the
+/// standard trick that lets any single wiring's writes land correctly.
+/// </summary>
+public sealed class Vrc24Mapper : IMapper
+{
+    private readonly byte[] _prg;
+    private readonly byte[] _chr;
+    private readonly bool _chrRam;
+    private readonly byte[] _prgRam = new byte[0x2000];
+    private readonly int _prgBanks8k, _chrBanks1k;
+    private readonly int _number;
+    private readonly bool _isVrc4;   // 21/23/25 carry the VRC4 IRQ; 22 is IRQ-less VRC2
+    private readonly bool _chrShift; // VRC2a (mapper 22) ignores the CHR low bit
+    private readonly int[] _chrLow = new int[8];
+    private readonly int[] _chrHigh = new int[8];
+    private readonly VrcIrq _irq = new();
+
+    private int _prgLow, _prgHigh, _swapMode;
+    private Mirroring _mirroring;
+
+    public Vrc24Mapper(INesRom rom)
+    {
+        _number = rom.MapperNumber;
+        _isVrc4 = rom.MapperNumber != 22;
+        _chrShift = rom.MapperNumber == 22;
+        _prg = rom.Prg;
+        _chrRam = rom.ChrIsRam;
+        _chr = rom.Chr.Length > 0 ? rom.Chr : new byte[0x2000];
+        _prgBanks8k = Math.Max(1, _prg.Length / 0x2000);
+        _chrBanks1k = Math.Max(1, _chr.Length / 0x400);
+        _mirroring = rom.Mirroring;
+    }
+
+    public int Number => _number;
+    public Mirroring Mirroring => _mirroring;
+    public bool IrqPending => _isVrc4 && _irq.Pending;
+
+    // Register-select bits, OR-ing every candidate address line for this mapper number.
+    private int Sub(ushort a) => _number switch
+    {
+        22 => ((a >> 1) & 1) | ((a & 1) << 1),                                   // VRC2a: A1,A0
+        21 => (((a >> 1) | (a >> 6)) & 1) | ((((a >> 2) | (a >> 7)) & 1) << 1),  // A1|A6, A2|A7
+        25 => (((a >> 1) | (a >> 3)) & 1) | (((a | (a >> 2)) & 1) << 1),         // A1|A3, A0|A2
+        _ => ((a | (a >> 2)) & 1) | ((((a >> 1) | (a >> 3)) & 1) << 1),          // 23: A0|A2, A1|A3
+    };
+
+    public byte CpuRead(ushort address)
+    {
+        if (address is >= 0x6000 and < 0x8000) return _prgRam[address - 0x6000];
+        if (address < 0x8000) return 0;
+        int bank = (address & 0xE000) switch
+        {
+            0x8000 => _swapMode == 0 ? _prgLow : _prgBanks8k - 2,
+            0xA000 => _prgHigh,
+            0xC000 => _swapMode == 0 ? _prgBanks8k - 2 : _prgLow,
+            _ => _prgBanks8k - 1,
+        };
+        return _prg[(bank % _prgBanks8k) * 0x2000 + (address & 0x1FFF)];
+    }
+
+    public void CpuWrite(ushort address, byte value)
+    {
+        if (address is >= 0x6000 and < 0x8000) { _prgRam[address - 0x6000] = value; return; }
+        if (address < 0x8000) return;
+
+        int sub = Sub(address);
+        switch (address & 0xF000)
+        {
+            case 0x8000: _prgLow = value & 0x1F; break;
+            case 0x9000:
+                if (sub < 2) _mirroring = MirrorOf(value);
+                else if (_isVrc4) _swapMode = (value >> 1) & 1;
+                break;
+            case 0xA000: _prgHigh = value & 0x1F; break;
+            case 0xB000: case 0xC000: case 0xD000: case 0xE000:
+            {
+                int region = (((address >> 12) & 0xF) - 0xB) * 2 + (sub >> 1);
+                if ((sub & 1) == 0) _chrLow[region] = value & 0x0F;
+                else _chrHigh[region] = value & 0x1F;
+                break;
+            }
+            case 0xF000:
+                if (!_isVrc4) break;
+                switch (sub)
+                {
+                    case 0: _irq.WriteLatchLow(value); break;
+                    case 1: _irq.WriteLatchHigh(value); break;
+                    case 2: _irq.WriteControl(value); break;
+                    case 3: _irq.Acknowledge(); break;
+                }
+                break;
+        }
+    }
+
+    public void OnCpuCycles(int cycles) { if (_isVrc4) _irq.Clock(cycles); }
+
+    public byte ChrRead(ushort address) => _chr[ChrOffset(address)];
+    public void ChrWrite(ushort address, byte value) { if (_chrRam) _chr[ChrOffset(address)] = value; }
+
+    private int ChrOffset(ushort address)
+    {
+        int region = (address >> 10) & 7;
+        int bank = (_chrHigh[region] << 4) | _chrLow[region];
+        if (_chrShift) bank >>= 1;
+        return (bank % _chrBanks1k) * 0x400 + (address & 0x3FF);
+    }
+
+    private Mirroring MirrorOf(byte v) => (_isVrc4 ? v & 3 : v & 1) switch
+    {
+        0 => Mirroring.Vertical,
+        1 => Mirroring.Horizontal,
+        2 => Mirroring.SingleScreenLower,
+        _ => Mirroring.SingleScreenUpper,
+    };
 }

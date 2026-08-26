@@ -57,6 +57,12 @@ public sealed class Apu
     /// <summary>The frame-counter IRQ or the DMC IRQ is asserted.</summary>
     public bool IrqPending => _frameIrq || _dmc.IrqPending;
 
+    /// <summary>
+    /// Returns and clears the CPU cycles stolen by DMC sample DMA since the last call. The machine
+    /// adds these to its master cycle count so the CPU falls behind exactly as it does on hardware.
+    /// </summary>
+    public int TakeDmcStall() { int s = _dmc.Stall; _dmc.Stall = 0; return s; }
+
     /// <summary>Resets the per-frame sample buffer. Call at the start of each frame.</summary>
     public void BeginFrame() => _count = 0;
 
@@ -370,6 +376,7 @@ public sealed class Apu
         private byte _sampleBuffer;
 
         public bool IrqPending;
+        public int Stall; // CPU cycles the pending sample DMA stole (consumed by the machine)
         public bool Active => _bytesRemaining > 0;
         public int Output() => _output; // 0-127
 
@@ -396,6 +403,7 @@ public sealed class Apu
             if (_bufferEmpty && _bytesRemaining > 0)
             {
                 _sampleBuffer = read(_curAddr);
+                Stall += 4; // the sample DMA halts the CPU ~4 cycles while it reads the byte
                 _bufferEmpty = false;
                 _curAddr = _curAddr == 0xFFFF ? (ushort)0x8000 : (ushort)(_curAddr + 1);
                 if (--_bytesRemaining == 0)

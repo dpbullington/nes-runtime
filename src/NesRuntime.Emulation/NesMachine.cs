@@ -84,18 +84,28 @@ public sealed class NesMachine : IBus
             }
 
             target += CyclesPerScanline;
+            long lineStart = _cycles;                    // CPU cycle count at the start of this line
+            bool visible = scanline < Ppu.Height;
             while (_cycles < (long)target)
             {
                 long before = _cycles;
                 _cycles += _cpu.Step();
                 int elapsed = (int)(_cycles - before);
-                _apu.Clock(elapsed);                    // advance audio by the instruction's cycles (incl. DMA)
-                _mapper.OnCpuCycles(elapsed);           // clock any CPU-cycle mapper IRQ (FME-7)
+                _apu.Clock(elapsed);                    // advance audio by the instruction's cycles
+
+                int stall = _apu.TakeDmcStall();        // DMC sample DMA halts the CPU ~4 cycles per fetch
+                if (stall > 0) { _cycles += stall; _apu.Clock(stall); elapsed += stall; }
+
+                _mapper.OnCpuCycles(elapsed);           // clock any CPU-cycle mapper IRQ (FME-7/VRC)
+                if (visible) _ppu.AdvanceSprite0((int)((_cycles - lineStart) * 3)); // reveal hit at its dot
                 RefreshIrq();
             }
 
-            if (scanline < Ppu.Height)
+            if (visible)
+            {
+                _ppu.AdvanceSprite0(int.MaxValue);      // ensure the hit is latched by the line's end
                 _ppu.EndVisibleScanline();
+            }
         }
     }
 

@@ -95,17 +95,25 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   LAX/SAX/DCP/ISC/SLO/RLA/SRE/RRA/ANC/ALR/ARR/SBX/undocumented NOPs + unstable stores — plus a
   level-triggered `IrqLine`),
   `Ppu` (scanline-accurate 2C02 — `NesMachine.StepFrame` interleaves CPU execution with per-scanline
-  rendering via the loopy v/t/x scroll regs, so scrolling + sprite-0 splits work),
+  rendering via the loopy v/t/x scroll regs, so scrolling + sprite-0 splits work; the **sprite-0 hit
+  is revealed at its exact dot** — `RenderScanline` records the overlap pixel and the machine's CPU
+  loop calls `Ppu.AdvanceSprite0(dot)` so a `$2002` poll flips at the right cycle, not at line start),
   `Apu` (2A03 audio — pulse ×2/triangle/noise/DMC + frame sequencer + non-linear mixer; clocked per
   CPU cycle, emits a float sample stream via `NesMachine.CopyAudio`; the DMC reads sample bytes via a
-  memory-reader callback — its DMA CPU-stall cycles are not modeled),
-  `Mapper` (NROM 0, MMC1 1, UxROM 2, CNROM 3, MMC3 4, AxROM 7, Color Dreams 11, GxROM 66,
-  Sunsoft FME-7 69; unknown mappers throw `NotSupportedException`). Two IRQ hooks on `IMapper`
-  (both default no-op, both drive `IMapper.IrqPending` → `Mos6502.IrqLine`): MMC3's scanline IRQ via
-  `OnScanline()` (clocked per rendered scanline), and FME-7's 16-bit CPU-cycle down-counter IRQ via
-  `OnCpuCycles(int)` (clocked in the CPU step loop). `IrqLine` is refreshed after each clock and
-  after every mapper write (so an `$E000` MMC3 acknowledge, or an FME-7 `$D` control write, clears
-  it). FME-7's 5B expansion audio is accepted but not synthesized.
+  memory-reader callback and reports its **DMA CPU-stall cycles** (~4/fetch) via `Apu.TakeDmcStall()`,
+  which the machine adds to the master cycle count so the CPU falls behind as on hardware),
+  `Mapper` (NROM 0, MMC1 1, UxROM 2, CNROM 3, MMC3 4, AxROM 7, MMC2 9, MMC4 10, Color Dreams 11,
+  Konami VRC2/VRC4 21·22·23·25 and VRC6 24·26, GxROM 66, Sunsoft FME-7 69; unknown mappers throw
+  `NotSupportedException`). Two IRQ hooks on `IMapper` (both default no-op, both drive
+  `IMapper.IrqPending` → `Mos6502.IrqLine`): MMC3's scanline IRQ via `OnScanline()` (clocked per
+  rendered scanline), and the CPU-cycle down-counter IRQs of FME-7 (16-bit) and Konami VRC4/VRC6
+  (8-bit + 341-dot prescaler, shared `VrcIrq` helper) via `OnCpuCycles(int)` (clocked in the CPU step
+  loop). `IrqLine` is refreshed after each clock and after every mapper write (so an `$E000` MMC3
+  acknowledge, an FME-7 `$D`, or a VRC control/ack write clears it). MMC2/MMC4 flip their CHR banks
+  via a **fetch latch** updated as a side effect of `ChrRead` (tile `$FD`/`$FE`), needing no PPU
+  change. FME-7's 5B and VRC6's expansion audio are accepted but not synthesized; VRC2/VRC4 register
+  select bits are decoded by OR-ing every candidate address line (robust to iNES-1.0 submapper
+  ambiguity).
   `INesRom` (iNES/NES 2.0 loader), and `NesMachine` (bus + controllers + per-frame step). The PPU
   fetches all CHR through `IMapper.ChrRead` and reads `IMapper.Mirroring` live, and the bus routes
   PRG through the mapper — so adding a (non-IRQ) mapper is just a new `IMapper` class, no PPU changes.
@@ -114,10 +122,13 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   (raw float samples → `MauiAudioBackend`) — escape hatches (`SoftwareRuntimeCore` prefers them over
   the tile/sprite compositor + SDK synth) that let a game emit whole frames + audio directly. Verified
   by CPU + mapper + scanline/sprite-0/IRQ + APU unit tests and hand-assembled ROMs (scratchpad harness).
-  It is scanline-accurate with the full APU and full illegal-opcode set covering ~80% of the library,
-  **not** Mesen parity: no dot-accurate timing (mid-scanline raster tricks; DMC DMA stalls), the
-  unstable stores (SHX/SHY/SHA/TAS/LAS) use the common "AND high-byte+1" behavior rather than being
-  bus-conflict/RDY accurate, and only the common mappers (0/1/2/3/4/7/11/66/69).
+  It is scanline-accurate with the full APU, full illegal-opcode set, dot-accurate sprite-0 timing,
+  DMC DMA stalls, and the common mappers (0/1/2/3/4/7/9/10/11/21-26/66/69 — well past 90% of the
+  licensed library). It is **not** Mesen parity: rendering is still per-scanline, so **mid-scanline
+  raster tricks** (a scroll/palette change landing partway across a visible line) resolve at scanline
+  granularity rather than per-dot; the unstable stores (SHX/SHY/SHA/TAS/LAS) use the common "AND
+  high-byte+1" behavior rather than being bus-conflict/RDY accurate; VRC6/FME-7 expansion audio is
+  silent; and VRC6 CHR banking mode 0 (eight 1 KiB banks) is the only mode modeled.
 
 ## Conventions that matter here
 
