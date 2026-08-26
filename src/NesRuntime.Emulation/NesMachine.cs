@@ -70,8 +70,7 @@ public sealed class NesMachine : IBus
             if (stall > 0) { _cycles += stall; _apu.Clock(stall); elapsed += stall; }
 
             _mapper.OnCpuCycles(elapsed);               // clock any CPU-cycle mapper IRQ (FME-7/VRC)
-            for (int i = 0; i < elapsed * 3 && !_ppu.FrameComplete; i++)
-                _ppu.Step();                            // three PPU dots per CPU cycle
+            _ppu.Run(elapsed * 3);                      // three PPU dots per CPU cycle
 
             RefreshIrq();
             if (_ppu.ConsumeNmi()) _cycles += _cpu.Nmi(); // vblank NMI, taken at the instruction boundary

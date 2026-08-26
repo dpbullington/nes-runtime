@@ -1,11 +1,13 @@
+using System.Runtime.CompilerServices;
+
 namespace NesRuntime.Emulation;
 
 /// <summary>
-/// A dot-accurate 2C02 PPU. It renders one dot (pixel clock) per <see cref="Step"/> — the machine
-/// steps it three dots per CPU cycle and applies CPU register writes between instructions — so a
-/// mid-scanline change to scroll ($2005/$2006), mask/palette ($2001/$3Fxx), or the mapper's CHR/
-/// nametable banking affects only the pixels drawn after it. That makes mid-frame raster tricks
-/// (split scrolls, per-line palette/CHR swaps) come out right, not just full-scanline effects.
+/// A dot-accurate 2C02 PPU. It renders one dot (pixel clock) per internal tick and <see cref="Run"/>
+/// advances a batch of dots — the machine runs it three dots per CPU cycle, applying CPU register
+/// writes between instructions — so a mid-scanline change to scroll ($2005/$2006), mask/palette
+/// ($2001/$3Fxx), or the mapper's CHR/nametable banking affects only the pixels drawn after it. That
+/// makes mid-frame raster tricks (split scrolls, per-line palette/CHR swaps) come out right.
 /// </summary>
 /// <remarks>
 /// The background runs the real fetch pipeline (nametable / attribute / two pattern bytes every 8
@@ -15,6 +17,10 @@ namespace NesRuntime.Emulation;
 /// gap versus silicon: because the CPU executes whole instructions atomically, a register write lands
 /// at instruction granularity (within a few CPU cycles / a handful of dots of its true position)
 /// rather than at the exact store cycle — enough for the raster effects games actually use.
+///
+/// Performance-sensitive: the per-dot loop caches the $2000/$2001 decode into fields (updated on
+/// write) so the hot path never re-masks control bits, and <see cref="Run"/> keeps the whole dot loop
+/// inside one method so the JIT can inline the tick.
 /// </remarks>
 public sealed class Ppu
 {
@@ -26,10 +32,15 @@ public sealed class Ppu
     private readonly byte[] _oam = new byte[0x100];
     private readonly byte[] _fb = new byte[Width * Height];
 
-    private byte _ctrl, _mask, _oamAddr, _readBuffer, _lastWrite;
+    private byte _oamAddr, _readBuffer, _lastWrite;
     private ushort _v, _t;
     private int _x;
     private bool _w;
+
+    // Cached decode of $2000/$2001 so the per-dot hot path avoids re-masking control bits every dot.
+    private bool _renderBg, _renderSprites, _renderBgLeft, _renderSpritesLeft, _rendering;
+    private bool _sprite16, _nmiEnabled;
+    private int _bgPatternBase, _spritePatternBase, _vramInc = 1;
 
     // Dot position and frame state.
     private int _scanline, _dot;
@@ -55,18 +66,8 @@ public sealed class Ppu
 
     public Ppu(IMapper mapper) => _mapper = mapper;
 
-    private bool NmiEnabled => (_ctrl & 0x80) != 0;
-    private int VramIncrement => (_ctrl & 0x04) != 0 ? 32 : 1;
-    private int BgPatternTable => (_ctrl & 0x10) != 0 ? 0x1000 : 0;
-    private int SpritePatternTable => (_ctrl & 0x08) != 0 ? 0x1000 : 0;
-    private bool Sprite16 => (_ctrl & 0x20) != 0;
-    private bool ShowBg => (_mask & 0x08) != 0;
-    private bool ShowSprites => (_mask & 0x10) != 0;
-    private bool ShowBgLeft => (_mask & 0x02) != 0;
-    private bool ShowSpritesLeft => (_mask & 0x04) != 0;
-
     /// <summary>True when background or sprite rendering is on.</summary>
-    public bool RenderingEnabled => ShowBg || ShowSprites;
+    public bool RenderingEnabled => _rendering;
 
     // --- Machine-facing frame driver ---
 
@@ -78,7 +79,7 @@ public sealed class Ppu
         _frameComplete = false;
     }
 
-    /// <summary>True once <see cref="Step"/> has wrapped past the pre-render line (a full frame elapsed).</summary>
+    /// <summary>True once the dot clock has wrapped past the pre-render line (a full frame elapsed).</summary>
     public bool FrameComplete => _frameComplete;
 
     /// <summary>Returns and clears a pending NMI edge (vblank start with NMI enabled).</summary>
@@ -87,46 +88,58 @@ public sealed class Ppu
     /// <summary>Copies the completed frame's 256×240 palette indices into <paramref name="dest"/>.</summary>
     public void CopyFrame(Span<byte> dest) => _fb.AsSpan(0, Math.Min(dest.Length, _fb.Length)).CopyTo(dest);
 
-    /// <summary>Advances the PPU by exactly one dot.</summary>
-    public void Step()
+    /// <summary>Advances the PPU by <paramref name="dots"/> dots, stopping early if the frame completes.</summary>
+    public void Run(int dots)
     {
-        if (_scanline < Height || _scanline == 261)
+        while (dots-- > 0)
         {
-            if (_scanline == 261 && _dot == 1)
-            {
-                VBlank = false; Sprite0Hit = false; SpriteOverflow = false; UpdateNmi();
-            }
+            Tick();
+            if (_frameComplete) return;
+        }
+    }
 
-            if (RenderingEnabled)
+    private void Tick()
+    {
+        int dot = _dot, scanline = _scanline;
+        bool visibleLine = scanline < Height;
+
+        if (_rendering && (visibleLine || scanline == 261))
+        {
+            if ((dot >= 2 && dot <= 257) || (dot >= 321 && dot <= 337))
             {
-                if ((_dot >= 2 && _dot <= 257) || (_dot >= 321 && _dot <= 337))
+                _bgPatLo <<= 1; _bgPatHi <<= 1; _bgAtLo <<= 1; _bgAtHi <<= 1;
+
+                if (_renderSprites && dot < 258)
                 {
-                    UpdateShifters();
-                    switch ((_dot - 1) & 7)
+                    for (int i = 0; i < _spriteCount; i++)
                     {
-                        case 0: ReloadShifters(); _ntByte = ReadVram((ushort)(0x2000 | (_v & 0x0FFF))); break;
-                        case 2: _atByte = FetchAttribute(); break;
-                        case 4: _patLoLatch = FetchPattern(0); break;
-                        case 6: _patHiLatch = FetchPattern(8); break;
-                        case 7: IncrementScrollX(); break;
+                        if (_spriteX[i] > 0) _spriteX[i]--;
+                        else { _spriteShiftLo[i] <<= 1; _spriteShiftHi[i] <<= 1; }
                     }
                 }
-                if (_dot == 256) IncrementScrollY();
-                if (_dot == 257) { ReloadShifters(); CopyHorizontal(); }
-                if (_dot == 338 || _dot == 340) _ntByte = ReadVram((ushort)(0x2000 | (_v & 0x0FFF)));
-                if (_scanline == 261 && _dot >= 280 && _dot <= 304) CopyVertical();
 
-                if (_dot == 257 && _scanline < Height) EvaluateSprites();
-                if (_dot == 340 && _scanline < Height) FetchSprites();
-
-                // MMC3-style scanline IRQ: approximate the A12 rise near the end of each rendered line.
-                if (_dot == 260) _mapper.OnScanline();
+                switch ((dot - 1) & 7)
+                {
+                    case 0: ReloadShifters(); _ntByte = ReadVram((ushort)(0x2000 | (_v & 0x0FFF))); break;
+                    case 2: _atByte = FetchAttribute(); break;
+                    case 4: _patLoLatch = FetchPattern(0); break;
+                    case 6: _patHiLatch = FetchPattern(8); break;
+                    case 7: IncrementScrollX(); break;
+                }
             }
+
+            if (dot == 256) IncrementScrollY();
+            if (dot == 257) { ReloadShifters(); CopyHorizontal(); if (visibleLine) EvaluateSprites(); }
+            if (dot == 260) _mapper.OnScanline();
+            if (dot == 340 && visibleLine) FetchSprites();
+            if (dot == 338 || dot == 340) _ntByte = ReadVram((ushort)(0x2000 | (_v & 0x0FFF)));
+            if (scanline == 261 && dot >= 280 && dot <= 304) CopyVertical();
         }
 
-        if (_scanline == 241 && _dot == 1) { VBlank = true; UpdateNmi(); }
+        if (scanline == 241 && dot == 1) { VBlank = true; UpdateNmi(); }
+        else if (scanline == 261 && dot == 1) { VBlank = false; Sprite0Hit = false; SpriteOverflow = false; UpdateNmi(); }
 
-        if (_scanline < Height && _dot >= 1 && _dot <= Width) RenderPixel();
+        if (visibleLine && dot >= 1 && dot <= Width) RenderPixel();
 
         if (++_dot > 340)
         {
@@ -137,28 +150,12 @@ public sealed class Ppu
 
     // --- Per-dot rendering ---
 
-    private void UpdateShifters()
-    {
-        if (ShowBg)
-        {
-            _bgPatLo <<= 1; _bgPatHi <<= 1; _bgAtLo <<= 1; _bgAtHi <<= 1;
-        }
-        if (ShowSprites && _dot >= 1 && _dot < 258)
-        {
-            for (int i = 0; i < _spriteCount; i++)
-            {
-                if (_spriteX[i] > 0) _spriteX[i]--;
-                else { _spriteShiftLo[i] <<= 1; _spriteShiftHi[i] <<= 1; }
-            }
-        }
-    }
-
     private void RenderPixel()
     {
         int px = _dot - 1;
 
         int bgPixel = 0, bgPal = 0;
-        if (ShowBg && (px >= 8 || ShowBgLeft))
+        if (_renderBg && (px >= 8 || _renderBgLeft))
         {
             ushort mux = (ushort)(0x8000 >> _x);
             int p0 = (_bgPatLo & mux) != 0 ? 1 : 0;
@@ -171,7 +168,7 @@ public sealed class Ppu
 
         int fgPixel = 0, fgPal = 0; bool fgPriority = false;
         _spriteZeroRendered = false;
-        if (ShowSprites && (px >= 8 || ShowSpritesLeft))
+        if (_renderSprites && (px >= 8 || _renderSpritesLeft))
         {
             for (int i = 0; i < _spriteCount; i++)
             {
@@ -193,12 +190,11 @@ public sealed class Ppu
         else if (fgPixel == 0) { pixel = bgPixel; pal = bgPal; }
         else
         {
-            if (fgPriority) { pixel = fgPixel; pal = fgPal; }
-            else { pixel = bgPixel; pal = bgPal; }
+            if (fgPriority) { pixel = fgPixel; pal = fgPal; } else { pixel = bgPixel; pal = bgPal; }
 
-            if (_spriteZeroPossible && _spriteZeroRendered && ShowBg && ShowSprites && px != 255)
+            if (_spriteZeroPossible && _spriteZeroRendered && _renderBg && _renderSprites && px != 255)
             {
-                int minPx = (!ShowBgLeft || !ShowSpritesLeft) ? 8 : 0;
+                int minPx = (!_renderBgLeft || !_renderSpritesLeft) ? 8 : 0;
                 if (px >= minPx) Sprite0Hit = true;
             }
         }
@@ -206,6 +202,7 @@ public sealed class Ppu
         _fb[_scanline * Width + px] = Palette(pixel == 0 ? 0 : pal * 4 + pixel);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private byte FetchAttribute()
     {
         ushort a = (ushort)(0x23C0 | (_v & 0x0C00) | ((_v >> 4) & 0x38) | ((_v >> 2) & 0x07));
@@ -213,12 +210,14 @@ public sealed class Ppu
         return (byte)((ReadVram(a) >> shift) & 3);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private byte FetchPattern(int plane)
     {
         int fineY = (_v >> 12) & 7;
-        return ReadVram((ushort)(BgPatternTable + _ntByte * 16 + fineY + plane));
+        return ReadVram((ushort)(_bgPatternBase + _ntByte * 16 + fineY + plane));
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ReloadShifters()
     {
         _bgPatLo = (ushort)((_bgPatLo & 0xFF00) | _patLoLatch);
@@ -231,7 +230,7 @@ public sealed class Ppu
     {
         _spriteCount = 0;
         _spriteZeroPossible = false;
-        int height = Sprite16 ? 16 : 8;
+        int height = _sprite16 ? 16 : 8;
         int i = 0;
         for (; i < 64 && _spriteCount < 8; i++)
         {
@@ -260,10 +259,10 @@ public sealed class Ppu
             int row = _scanline - _spriteY[i];
 
             ushort addr;
-            if (!Sprite16)
+            if (!_sprite16)
             {
                 int r = flipV ? 7 - row : row;
-                addr = (ushort)(SpritePatternTable + tile * 16 + r);
+                addr = (ushort)(_spritePatternBase + tile * 16 + r);
             }
             else
             {
@@ -288,7 +287,7 @@ public sealed class Ppu
 
     private void UpdateNmi()
     {
-        bool line = VBlank && NmiEnabled;
+        bool line = VBlank && _nmiEnabled;
         if (line && !_nmiPrev) _nmiLatch = true;
         _nmiPrev = line;
     }
@@ -310,7 +309,7 @@ public sealed class Ppu
                 ushort a = (ushort)(_v & 0x3FFF);
                 if (a < 0x3F00) { result = _readBuffer; _readBuffer = ReadVram(a); }
                 else { result = ReadVram(a); _readBuffer = ReadVram((ushort)(a - 0x1000)); }
-                _v += (ushort)VramIncrement;
+                _v += (ushort)_vramInc;
                 return result;
             default:
                 return _lastWrite;
@@ -322,8 +321,22 @@ public sealed class Ppu
         _lastWrite = value;
         switch (reg & 7)
         {
-            case 0: _ctrl = value; _t = (ushort)((_t & 0xF3FF) | ((value & 3) << 10)); UpdateNmi(); break;
-            case 1: _mask = value; break;
+            case 0:
+                _t = (ushort)((_t & 0xF3FF) | ((value & 3) << 10));
+                _nmiEnabled = (value & 0x80) != 0;
+                _vramInc = (value & 0x04) != 0 ? 32 : 1;
+                _bgPatternBase = (value & 0x10) != 0 ? 0x1000 : 0;
+                _spritePatternBase = (value & 0x08) != 0 ? 0x1000 : 0;
+                _sprite16 = (value & 0x20) != 0;
+                UpdateNmi();
+                break;
+            case 1:
+                _renderBg = (value & 0x08) != 0;
+                _renderSprites = (value & 0x10) != 0;
+                _renderBgLeft = (value & 0x02) != 0;
+                _renderSpritesLeft = (value & 0x04) != 0;
+                _rendering = _renderBg || _renderSprites;
+                break;
             case 3: _oamAddr = value; break;
             case 4: _oam[_oamAddr++] = value; break;
             case 5:
@@ -336,7 +349,7 @@ public sealed class Ppu
                 break;
             case 7:
                 WriteVram((ushort)(_v & 0x3FFF), value);
-                _v += (ushort)VramIncrement;
+                _v += (ushort)_vramInc;
                 break;
         }
     }
@@ -350,6 +363,7 @@ public sealed class Ppu
 
     // --- Loopy scroll updates ---
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void IncrementScrollX()
     {
         if ((_v & 0x001F) == 31) { _v = (ushort)(_v & ~0x001F); _v ^= 0x0400; }
@@ -378,6 +392,7 @@ public sealed class Ppu
 
     // --- VRAM access ---
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private byte ReadVram(ushort a)
     {
         if (a < 0x2000) return _mapper.ChrRead(a);
@@ -414,5 +429,6 @@ public sealed class Ppu
         return i;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private byte Palette(int i) => (byte)(_palette[PaletteIndex((ushort)(0x3F00 + i))] & 0x3F);
 }
