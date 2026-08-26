@@ -94,10 +94,14 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   from the C# authoring SDK: `Mos6502` (full official **and** unofficial/illegal 6502 opcode set —
   LAX/SAX/DCP/ISC/SLO/RLA/SRE/RRA/ANC/ALR/ARR/SBX/undocumented NOPs + unstable stores — plus a
   level-triggered `IrqLine`),
-  `Ppu` (scanline-accurate 2C02 — `NesMachine.StepFrame` interleaves CPU execution with per-scanline
-  rendering via the loopy v/t/x scroll regs, so scrolling + sprite-0 splits work; the **sprite-0 hit
-  is revealed at its exact dot** — `RenderScanline` records the overlap pixel and the machine's CPU
-  loop calls `Ppu.AdvanceSprite0(dot)` so a `$2002` poll flips at the right cycle, not at line start),
+  `Ppu` (**dot-accurate 2C02** — `Ppu.Step` renders one dot per call and `NesMachine.StepFrame` steps
+  it three dots per CPU cycle, applying CPU writes between instructions, so a mid-scanline change to
+  scroll/mask/palette or the mapper's CHR/nametable banking affects only the pixels drawn after it —
+  i.e. **mid-frame raster splits** work, not just full-scanline effects. It runs the real background
+  fetch pipeline (nametable/attribute/two pattern bytes every 8 dots into 16-bit shift registers, with
+  the loopy v/t/x increments + copies) and evaluates + pattern-fetches sprites at each line's end into
+  per-sprite shifters, composited per dot with priority/transparency/flip/8×16 and a dot-exact
+  sprite-0 hit; NMI is an edge off vblank via `Ppu.ConsumeNmi`),
   `Apu` (2A03 audio — pulse ×2/triangle/noise/DMC + frame sequencer + non-linear mixer; clocked per
   CPU cycle, emits a float sample stream via `NesMachine.CopyAudio`; the DMC reads sample bytes via a
   memory-reader callback and reports its **DMA CPU-stall cycles** (~4/fetch) via `Apu.TakeDmcStall()`,
@@ -121,14 +125,18 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   via the **`NesGame.RenderFramebuffer` hook** (raw video) and the **`NesGame.RenderAudio` hook**
   (raw float samples → `MauiAudioBackend`) — escape hatches (`SoftwareRuntimeCore` prefers them over
   the tile/sprite compositor + SDK synth) that let a game emit whole frames + audio directly. Verified
-  by CPU + mapper + scanline/sprite-0/IRQ + APU unit tests and hand-assembled ROMs (scratchpad harness).
-  It is scanline-accurate with the full APU, full illegal-opcode set, dot-accurate sprite-0 timing,
-  DMC DMA stalls, and the common mappers (0/1/2/3/4/7/9/10/11/21-26/66/69 — well past 90% of the
-  licensed library). It is **not** Mesen parity: rendering is still per-scanline, so **mid-scanline
-  raster tricks** (a scroll/palette change landing partway across a visible line) resolve at scanline
-  granularity rather than per-dot; the unstable stores (SHX/SHY/SHA/TAS/LAS) use the common "AND
-  high-byte+1" behavior rather than being bus-conflict/RDY accurate; VRC6/FME-7 expansion audio is
-  silent; and VRC6 CHR banking mode 0 (eight 1 KiB banks) is the only mode modeled.
+  by CPU + mapper + APU unit tests, a hand-assembled **mid-scanline raster-split ROM** (proves the
+  per-dot pipeline: a row splits bg→backdrop mid-line, which a per-scanline renderer can't produce),
+  and other hand-assembled ROMs (scratchpad harness).
+  It is dot-accurate with the full APU, full illegal-opcode set, DMC DMA stalls, and the common
+  mappers (0/1/2/3/4/7/9/10/11/21-26/66/69 — well past 90% of the licensed library). The remaining gap
+  versus Mesen: because the CPU executes whole instructions atomically (not cycle-stepped), a register
+  write takes effect at **instruction granularity** — within a few CPU cycles / a handful of dots of
+  its true store cycle — so a raster split lands on the right scanline and within a few pixels
+  horizontally, not at the exact dot. Also: the unstable stores (SHX/SHY/SHA/TAS/LAS) use the common
+  "AND high-byte+1" behavior rather than being bus-conflict/RDY accurate; VRC6/FME-7 expansion audio
+  is silent; VRC6 CHR banking mode 0 (eight 1 KiB banks) is the only mode modeled; and the PPUMASK
+  grayscale/color-emphasis bits ($2001 bits 0, 5-7) are not applied to the output palette index.
 
 ## Conventions that matter here
 

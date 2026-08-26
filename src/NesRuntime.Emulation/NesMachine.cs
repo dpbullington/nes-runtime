@@ -14,10 +14,6 @@ public enum NesButton : byte
 /// </summary>
 public sealed class NesMachine : IBus
 {
-    // NTSC timing: 262 scanlines/frame, each 341 PPU dots = 341/3 CPU cycles.
-    private const double CyclesPerScanline = 341.0 / 3.0;
-    private const int ScanlinesPerFrame = 262;
-
     private readonly byte[] _ram = new byte[0x800];
     private readonly Mos6502 _cpu;
     private readonly Ppu _ppu;
@@ -52,61 +48,36 @@ public sealed class NesMachine : IBus
     }
 
     /// <summary>
-    /// Runs one full frame, rendering scanline by scanline and interleaving CPU execution in
-    /// scanline-sized cycle chunks so mid-frame register writes and sprite-0 hit land at the right
-    /// line.
+    /// Runs one full frame. The CPU executes an instruction at a time and the PPU is caught up three
+    /// dots per CPU cycle after each one, so register/CHR/palette writes take effect between
+    /// instructions and only affect the pixels the PPU draws afterward — mid-scanline raster effects.
+    /// The PPU sets vblank / sprite-0 hit / mapper scanline IRQ at their exact dots as it steps.
     /// </summary>
     public void StepFrame(Span<byte> framebuffer)
     {
         _cycles = 0;
-        double target = 0;
         _apu.BeginFrame();
-        for (int scanline = 0; scanline < ScanlinesPerFrame; scanline++)
+        _ppu.BeginFrame();
+
+        while (!_ppu.FrameComplete)
         {
-            if (scanline == 241)
-            {
-                if (_ppu.EnterVBlank())
-                    _cycles += _cpu.Nmi();
-            }
-            else if (scanline == 261)
-            {
-                _ppu.PreRender();
-            }
+            long before = _cycles;
+            _cycles += _cpu.Step();
+            int elapsed = (int)(_cycles - before);
+            _apu.Clock(elapsed);                        // advance audio by the instruction's cycles
 
-            if (scanline < Ppu.Height)
-            {
-                _ppu.RenderScanline(scanline, framebuffer); // render before this line's CPU runs
-                if (_ppu.RenderingEnabled)
-                {
-                    _mapper.OnScanline();               // clock the mapper's scanline IRQ counter
-                    RefreshIrq();
-                }
-            }
+            int stall = _apu.TakeDmcStall();            // DMC sample DMA halts the CPU ~4 cycles per fetch
+            if (stall > 0) { _cycles += stall; _apu.Clock(stall); elapsed += stall; }
 
-            target += CyclesPerScanline;
-            long lineStart = _cycles;                    // CPU cycle count at the start of this line
-            bool visible = scanline < Ppu.Height;
-            while (_cycles < (long)target)
-            {
-                long before = _cycles;
-                _cycles += _cpu.Step();
-                int elapsed = (int)(_cycles - before);
-                _apu.Clock(elapsed);                    // advance audio by the instruction's cycles
+            _mapper.OnCpuCycles(elapsed);               // clock any CPU-cycle mapper IRQ (FME-7/VRC)
+            for (int i = 0; i < elapsed * 3 && !_ppu.FrameComplete; i++)
+                _ppu.Step();                            // three PPU dots per CPU cycle
 
-                int stall = _apu.TakeDmcStall();        // DMC sample DMA halts the CPU ~4 cycles per fetch
-                if (stall > 0) { _cycles += stall; _apu.Clock(stall); elapsed += stall; }
-
-                _mapper.OnCpuCycles(elapsed);           // clock any CPU-cycle mapper IRQ (FME-7/VRC)
-                if (visible) _ppu.AdvanceSprite0((int)((_cycles - lineStart) * 3)); // reveal hit at its dot
-                RefreshIrq();
-            }
-
-            if (visible)
-            {
-                _ppu.AdvanceSprite0(int.MaxValue);      // ensure the hit is latched by the line's end
-                _ppu.EndVisibleScanline();
-            }
+            RefreshIrq();
+            if (_ppu.ConsumeNmi()) _cycles += _cpu.Nmi(); // vblank NMI, taken at the instruction boundary
         }
+
+        _ppu.CopyFrame(framebuffer);
     }
 
     // --- IBus: the CPU address map ---
