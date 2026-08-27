@@ -3,24 +3,21 @@ using System.Runtime.CompilerServices;
 namespace NesRuntime.Emulation;
 
 /// <summary>
-/// A dot-accurate 2C02 PPU. It renders one dot (pixel clock) per internal tick and <see cref="Run"/>
-/// advances a batch of dots — the machine runs it three dots per CPU cycle, applying CPU register
-/// writes between instructions — so a mid-scanline change to scroll ($2005/$2006), mask/palette
-/// ($2001/$3Fxx), or the mapper's CHR/nametable banking affects only the pixels drawn after it. That
-/// makes mid-frame raster tricks (split scrolls, per-line palette/CHR swaps) come out right.
+/// A 2C02 PPU with mid-scanline accuracy at scanline-batch speed. It renders each visible line as a
+/// fast span (directly from the loopy scroll registers), but renders <em>lazily</em>: a line's pixels
+/// are only emitted up to the current dot, and the machine forces a <see cref="CatchUp"/> right before
+/// any write that changes the picture (PPU register, palette, or the mapper's CHR/nametable banking)
+/// and before every $2002 read. So a mid-scanline scroll/mask/palette/CHR change affects only the
+/// pixels drawn after it, and the sprite-0 hit becomes visible at the dot the CPU polls it — i.e.
+/// mid-frame raster splits and status-bar splits come out right.
 /// </summary>
 /// <remarks>
-/// The background runs the real fetch pipeline (nametable / attribute / two pattern bytes every 8
-/// dots into 16-bit shift registers, with the loopy v/t/x scroll increments and copies), and sprites
-/// are evaluated + pattern-fetched at the end of each line into per-sprite shifters, then composited
-/// per dot with priority, transparency, flipping, 8×8 / 8×16, and a dot-exact sprite-0 hit. The one
-/// gap versus silicon: because the CPU executes whole instructions atomically, a register write lands
-/// at instruction granularity (within a few CPU cycles / a handful of dots of its true position)
-/// rather than at the exact store cycle — enough for the raster effects games actually use.
-///
-/// Performance-sensitive: the per-dot loop caches the $2000/$2001 decode into fields (updated on
-/// write) so the hot path never re-masks control bits, and <see cref="Run"/> keeps the whole dot loop
-/// inside one method so the JIT can inline the tick.
+/// The win over a pure per-dot PPU is speed: when a line has no mid-line writes it is drawn in a
+/// single span at the end of its active display (dot 256), the same cost as a plain scanline
+/// renderer; only the lines that actually do raster tricks pay the finer-grained catch-up cost. The
+/// residual inaccuracy is the same as any instruction-atomic CPU: a write lands within a few CPU
+/// cycles / a handful of dots of its true position, so a split lands on the right scanline and within
+/// a few pixels horizontally, not at the exact dot.
 /// </remarks>
 public sealed class Ppu
 {
@@ -37,28 +34,25 @@ public sealed class Ppu
     private int _x;
     private bool _w;
 
-    // Cached decode of $2000/$2001 so the per-dot hot path avoids re-masking control bits every dot.
+    // Cached decode of $2000/$2001 so the render path avoids re-masking control bits.
     private bool _renderBg, _renderSprites, _renderBgLeft, _renderSpritesLeft, _rendering;
     private bool _sprite16, _nmiEnabled;
     private int _bgPatternBase, _spritePatternBase, _vramInc = 1;
 
-    // Dot position and frame state.
-    private int _scanline, _dot;
+    // Time position and per-line lazy-render state.
+    private int _scanline, _dot;      // dot clock (scanline 0-261, dot 0-340)
+    private int _renderX;             // next visible column already emitted on this line (0-256)
+    private int _vBaseCol;            // column at which the current scroll v took effect
+    private bool _lineEvaluated;      // sprites evaluated for this line yet
     private bool _frameComplete, _nmiLatch, _nmiPrev;
 
-    // Background fetch pipeline.
-    private byte _ntByte, _atByte, _patLoLatch, _patHiLatch;
-    private ushort _bgPatLo, _bgPatHi, _bgAtLo, _bgAtHi;
-
-    // Sprites evaluated for the next scanline.
-    private readonly byte[] _spriteY = new byte[8];
-    private readonly byte[] _spriteTile = new byte[8];
-    private readonly byte[] _spriteAttr = new byte[8];
-    private readonly byte[] _spriteX = new byte[8];
-    private readonly byte[] _spriteShiftLo = new byte[8];
-    private readonly byte[] _spriteShiftHi = new byte[8];
-    private int _spriteCount;
-    private bool _spriteZeroPossible, _spriteZeroRendered;
+    // Sprites evaluated for the current visible line (pattern bytes pre-fetched once per line).
+    private readonly int[] _sprX = new int[8];
+    private readonly int[] _sprAttr = new int[8];
+    private readonly byte[] _sprLo = new byte[8];
+    private readonly byte[] _sprHi = new byte[8];
+    private readonly bool[] _sprIsZero = new bool[8];
+    private int _sprCount, _sprHeight = 8;
 
     public bool VBlank { get; private set; }
     public bool Sprite0Hit { get; private set; }
@@ -76,6 +70,9 @@ public sealed class Ppu
     {
         _scanline = 0;
         _dot = 0;
+        _renderX = 0;
+        _vBaseCol = 0;
+        _lineEvaluated = false;
         _frameComplete = false;
     }
 
@@ -88,192 +85,178 @@ public sealed class Ppu
     /// <summary>Copies the completed frame's 256×240 palette indices into <paramref name="dest"/>.</summary>
     public void CopyFrame(Span<byte> dest) => _fb.AsSpan(0, Math.Min(dest.Length, _fb.Length)).CopyTo(dest);
 
-    /// <summary>Advances the PPU by <paramref name="dots"/> dots, stopping early if the frame completes.</summary>
+    /// <summary>
+    /// Advances the dot clock by <paramref name="dots"/>, firing scroll/flag events at their dots and
+    /// emitting each visible line's pixels when its active display ends (or when <see cref="CatchUp"/>
+    /// is forced by a write/read). Stops early if the frame completes.
+    /// </summary>
     public void Run(int dots)
     {
-        while (dots-- > 0)
+        while (dots > 0 && !_frameComplete)
         {
-            Tick();
-            if (_frameComplete) return;
-        }
-    }
+            int seg = Math.Min(341 - _dot, dots);
+            ProcessSegment(_dot, _dot + seg);
+            _dot += seg;
+            dots -= seg;
 
-    private void Tick()
-    {
-        int dot = _dot, scanline = _scanline;
-        bool visibleLine = scanline < Height;
-
-        if (_rendering && (visibleLine || scanline == 261))
-        {
-            if ((dot >= 2 && dot <= 257) || (dot >= 321 && dot <= 337))
+            if (_dot >= 341)
             {
-                _bgPatLo <<= 1; _bgPatHi <<= 1; _bgAtLo <<= 1; _bgAtHi <<= 1;
-
-                if (_renderSprites && dot < 258)
-                {
-                    for (int i = 0; i < _spriteCount; i++)
-                    {
-                        if (_spriteX[i] > 0) _spriteX[i]--;
-                        else { _spriteShiftLo[i] <<= 1; _spriteShiftHi[i] <<= 1; }
-                    }
-                }
-
-                switch ((dot - 1) & 7)
-                {
-                    case 0: ReloadShifters(); _ntByte = ReadVram((ushort)(0x2000 | (_v & 0x0FFF))); break;
-                    case 2: _atByte = FetchAttribute(); break;
-                    case 4: _patLoLatch = FetchPattern(0); break;
-                    case 6: _patHiLatch = FetchPattern(8); break;
-                    case 7: IncrementScrollX(); break;
-                }
-            }
-
-            if (dot == 256) IncrementScrollY();
-            if (dot == 257) { ReloadShifters(); CopyHorizontal(); if (visibleLine) EvaluateSprites(); }
-            if (dot == 260) _mapper.OnScanline();
-            if (dot == 340 && visibleLine) FetchSprites();
-            if (dot == 338 || dot == 340) _ntByte = ReadVram((ushort)(0x2000 | (_v & 0x0FFF)));
-            if (scanline == 261 && dot >= 280 && dot <= 304) CopyVertical();
-        }
-
-        if (scanline == 241 && dot == 1) { VBlank = true; UpdateNmi(); }
-        else if (scanline == 261 && dot == 1) { VBlank = false; Sprite0Hit = false; SpriteOverflow = false; UpdateNmi(); }
-
-        if (visibleLine && dot >= 1 && dot <= Width) RenderPixel();
-
-        if (++_dot > 340)
-        {
-            _dot = 0;
-            if (++_scanline > 261) { _scanline = 0; _frameComplete = true; }
-        }
-    }
-
-    // --- Per-dot rendering ---
-
-    private void RenderPixel()
-    {
-        int px = _dot - 1;
-
-        int bgPixel = 0, bgPal = 0;
-        if (_renderBg && (px >= 8 || _renderBgLeft))
-        {
-            ushort mux = (ushort)(0x8000 >> _x);
-            int p0 = (_bgPatLo & mux) != 0 ? 1 : 0;
-            int p1 = (_bgPatHi & mux) != 0 ? 1 : 0;
-            bgPixel = (p1 << 1) | p0;
-            int a0 = (_bgAtLo & mux) != 0 ? 1 : 0;
-            int a1 = (_bgAtHi & mux) != 0 ? 1 : 0;
-            bgPal = (a1 << 1) | a0;
-        }
-
-        int fgPixel = 0, fgPal = 0; bool fgPriority = false;
-        _spriteZeroRendered = false;
-        if (_renderSprites && (px >= 8 || _renderSpritesLeft))
-        {
-            for (int i = 0; i < _spriteCount; i++)
-            {
-                if (_spriteX[i] != 0) continue;
-                int p0 = (_spriteShiftLo[i] & 0x80) != 0 ? 1 : 0;
-                int p1 = (_spriteShiftHi[i] & 0x80) != 0 ? 1 : 0;
-                int p = (p1 << 1) | p0;
-                if (p == 0) continue;
-                fgPixel = p;
-                fgPal = (_spriteAttr[i] & 3) + 4;
-                fgPriority = (_spriteAttr[i] & 0x20) == 0;
-                if (i == 0) _spriteZeroRendered = true;
-                break;
+                _dot = 0;
+                _renderX = 0;
+                _vBaseCol = 0;
+                _lineEvaluated = false;
+                if (++_scanline > 261) { _scanline = 0; _frameComplete = true; }
             }
         }
+    }
 
-        int pixel, pal;
-        if (bgPixel == 0) { pixel = fgPixel; pal = fgPal; }
-        else if (fgPixel == 0) { pixel = bgPixel; pal = bgPal; }
-        else
+    /// <summary>
+    /// Emits the current visible line's pixels up to the current dot. Called before any write that
+    /// changes the picture and before $2002 reads, so those observe/precede exactly the pixels that
+    /// were already on screen.
+    /// </summary>
+    public void CatchUp()
+    {
+        if (_scanline >= Height) return;
+        RenderLineUpTo(Math.Clamp(_dot - 1, 0, Width));
+    }
+
+    private void ProcessSegment(int from, int to)
+    {
+        int sl = _scanline;
+
+        if (sl == 241 && from <= 1 && 1 < to) { VBlank = true; UpdateNmi(); }
+        else if (sl == 261 && from <= 1 && 1 < to) { VBlank = false; Sprite0Hit = false; SpriteOverflow = false; UpdateNmi(); }
+
+        bool visible = sl < Height;
+        bool renderLine = visible || sl == 261;
+
+        if (renderLine && _rendering && from <= 260 && 260 < to)
+            _mapper.OnScanline();                       // MMC3-style scanline IRQ, ~A12 rise
+
+        // End of active display: finish the visible line, then apply the hblank scroll increments.
+        if (from <= 256 && 256 < to)
         {
-            if (fgPriority) { pixel = fgPixel; pal = fgPal; } else { pixel = bgPixel; pal = bgPal; }
-
-            if (_spriteZeroPossible && _spriteZeroRendered && _renderBg && _renderSprites && px != 255)
-            {
-                int minPx = (!_renderBgLeft || !_renderSpritesLeft) ? 8 : 0;
-                if (px >= minPx) Sprite0Hit = true;
-            }
+            if (visible) RenderLineUpTo(Width);
+            if (renderLine && _rendering) IncrementScrollY();
         }
-
-        _fb[_scanline * Width + px] = Palette(pixel == 0 ? 0 : pal * 4 + pixel);
+        if (renderLine && _rendering)
+        {
+            if (from <= 257 && 257 < to) CopyHorizontal();
+            if (sl == 261 && from < 305 && to > 280) CopyVertical();
+        }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private byte FetchAttribute()
+    // --- Lazy scanline rendering ---
+
+    private void RenderLineUpTo(int col)
     {
-        ushort a = (ushort)(0x23C0 | (_v & 0x0C00) | ((_v >> 4) & 0x38) | ((_v >> 2) & 0x07));
-        int shift = ((_v >> 4) & 4) | (_v & 2);
-        return (byte)((ReadVram(a) >> shift) & 3);
+        if (_scanline >= Height || col <= _renderX) return;
+        if (!_lineEvaluated) { if (_renderSprites) EvaluateSpriteLine(); _lineEvaluated = true; }
+        RenderSpan(_renderX, col);
+        _renderX = col;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private byte FetchPattern(int plane)
+    private void RenderSpan(int cStart, int cEnd)
     {
+        int rowBase = _scanline * Width;
         int fineY = (_v >> 12) & 7;
-        return ReadVram((ushort)(_bgPatternBase + _ntByte * 16 + fineY + plane));
-    }
+        int coarseY = (_v >> 5) & 0x1F;
+        int originX = ((_v >> 10) & 1) * 256 + (_v & 0x1F) * 8 + _x;
+        int ntBaseY = 0x2000 + ((_v >> 11) & 1) * 0x800;
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void ReloadShifters()
-    {
-        _bgPatLo = (ushort)((_bgPatLo & 0xFF00) | _patLoLatch);
-        _bgPatHi = (ushort)((_bgPatHi & 0xFF00) | _patHiLatch);
-        _bgAtLo = (ushort)((_bgAtLo & 0xFF00) | ((_atByte & 1) != 0 ? 0xFF : 0));
-        _bgAtHi = (ushort)((_bgAtHi & 0xFF00) | ((_atByte & 2) != 0 ? 0xFF : 0));
-    }
+        // Background tile fetch is cached across a tile's 8 pixels (refetched on a tile boundary).
+        int lastTile = -1;
+        byte patLo = 0, patHi = 0;
+        int tilePal = 0;
 
-    private void EvaluateSprites()
-    {
-        _spriteCount = 0;
-        _spriteZeroPossible = false;
-        int height = _sprite16 ? 16 : 8;
-        int i = 0;
-        for (; i < 64 && _spriteCount < 8; i++)
+        for (int c = cStart; c < cEnd; c++)
         {
-            int diff = _scanline - _oam[i * 4];
-            if (diff < 0 || diff >= height) continue;
-            if (i == 0) _spriteZeroPossible = true;
-            _spriteY[_spriteCount] = _oam[i * 4];
-            _spriteTile[_spriteCount] = _oam[i * 4 + 1];
-            _spriteAttr[_spriteCount] = _oam[i * 4 + 2];
-            _spriteX[_spriteCount] = _oam[i * 4 + 3];
-            _spriteCount++;
-        }
-        for (; i < 64; i++)
-        {
-            int diff = _scanline - _oam[i * 4];
-            if (diff >= 0 && diff < height) { SpriteOverflow = true; break; }
-        }
-    }
-
-    private void FetchSprites()
-    {
-        for (int i = 0; i < _spriteCount; i++)
-        {
-            int tile = _spriteTile[i], attr = _spriteAttr[i];
-            bool flipH = (attr & 0x40) != 0, flipV = (attr & 0x80) != 0;
-            int row = _scanline - _spriteY[i];
-
-            ushort addr;
-            if (!_sprite16)
+            int bgPixel = 0, bgPal = 0;
+            if (_renderBg && (c >= 8 || _renderBgLeft))
             {
-                int r = flipV ? 7 - row : row;
-                addr = (ushort)(_spritePatternBase + tile * 16 + r);
+                int px = (originX + (c - _vBaseCol)) & 0x1FF;
+                int tileIndex = px >> 3;
+                if (tileIndex != lastTile)
+                {
+                    lastTile = tileIndex;
+                    int localX = px & 0xFF, tileCol = localX >> 3;
+                    int ntBase = ntBaseY + (px >> 8) * 0x400;
+                    byte tile = ReadVram((ushort)(ntBase + coarseY * 32 + tileCol));
+                    byte attr = ReadVram((ushort)(ntBase + 0x3C0 + (coarseY / 4) * 8 + (tileCol / 4)));
+                    tilePal = (attr >> (((coarseY & 2) << 1) | (tileCol & 2))) & 3;
+                    int chr = _bgPatternBase + tile * 16 + fineY;
+                    patLo = _mapper.ChrRead((ushort)chr);
+                    patHi = _mapper.ChrRead((ushort)(chr + 8));
+                }
+                int bit = 7 - (px & 7);
+                bgPixel = ((patLo >> bit) & 1) | (((patHi >> bit) & 1) << 1);
+                bgPal = tilePal;
+            }
+
+            int outPixel = bgPixel, outPal = bgPal;
+            if (_renderSprites && (c >= 8 || _renderSpritesLeft))
+            {
+                for (int k = 0; k < _sprCount; k++)
+                {
+                    int x0 = _sprX[k];
+                    if (c < x0 || c >= x0 + 8) continue;
+
+                    int bit = 7 - (c - x0);
+                    int val = ((_sprLo[k] >> bit) & 1) | (((_sprHi[k] >> bit) & 1) << 1);
+                    if (val == 0) continue;
+
+                    if (_sprIsZero[k] && _renderBg && bgPixel != 0 && c != 255)
+                        Sprite0Hit = true;
+
+                    if (!((_sprAttr[k] & 0x20) != 0 && bgPixel != 0)) { outPixel = val; outPal = (_sprAttr[k] & 3) + 4; }
+                    break; // first opaque sprite pixel wins
+                }
+            }
+
+            _fb[rowBase + c] = Palette(outPixel == 0 ? 0 : outPal * 4 + outPixel);
+        }
+    }
+
+    private void EvaluateSpriteLine()
+    {
+        _sprCount = 0;
+        _sprHeight = _sprite16 ? 16 : 8;
+        int i = 0;
+        for (; i < 64 && _sprCount < 8; i++)
+        {
+            int top = _oam[i * 4] + 1;
+            if (_scanline < top || _scanline >= top + _sprHeight) continue;
+
+            int tile = _oam[i * 4 + 1], attr = _oam[i * 4 + 2];
+            int row = _scanline - top;
+            if ((attr & 0x80) != 0) row = _sprHeight - 1 - row; // flipV
+
+            int chr;
+            if (_sprite16)
+            {
+                int table = (tile & 1) * 0x1000, baseTile = tile & 0xFE;
+                chr = table + (row < 8 ? baseTile : baseTile + 1) * 16 + (row & 7);
             }
             else
             {
-                int r = flipV ? 15 - row : row;
-                int baseTile = (tile & 0xFE) + (r < 8 ? 0 : 1);
-                addr = (ushort)((tile & 1) * 0x1000 + baseTile * 16 + (r & 7));
+                chr = _spritePatternBase + tile * 16 + row;
             }
 
-            byte lo = _mapper.ChrRead(addr), hi = _mapper.ChrRead((ushort)(addr + 8));
-            if (flipH) { lo = Reverse(lo); hi = Reverse(hi); }
-            _spriteShiftLo[i] = lo; _spriteShiftHi[i] = hi;
+            byte lo = _mapper.ChrRead((ushort)chr), hi = _mapper.ChrRead((ushort)(chr + 8));
+            if ((attr & 0x40) != 0) { lo = Reverse(lo); hi = Reverse(hi); } // flipH
+
+            _sprX[_sprCount] = _oam[i * 4 + 3];
+            _sprAttr[_sprCount] = attr;
+            _sprLo[_sprCount] = lo;
+            _sprHi[_sprCount] = hi;
+            _sprIsZero[_sprCount] = i == 0;
+            _sprCount++;
+        }
+        for (; i < 64; i++)
+        {
+            int top = _oam[i * 4] + 1;
+            if (_scanline >= top && _scanline < top + _sprHeight) { SpriteOverflow = true; break; }
         }
     }
 
@@ -299,6 +282,7 @@ public sealed class Ppu
         switch (reg & 7)
         {
             case 2:
+                CatchUp(); // render up to now so a sprite-0-hit poll flips at the right dot
                 byte s = (byte)((VBlank ? 0x80 : 0) | (Sprite0Hit ? 0x40 : 0) | (SpriteOverflow ? 0x20 : 0));
                 VBlank = false; _w = false; UpdateNmi();
                 return (byte)(s | (_lastWrite & 0x1F));
@@ -318,6 +302,7 @@ public sealed class Ppu
 
     public void WriteRegister(int reg, byte value)
     {
+        CatchUp(); // any picture-affecting change applies only to pixels drawn after this dot
         _lastWrite = value;
         switch (reg & 7)
         {
@@ -342,10 +327,12 @@ public sealed class Ppu
             case 5:
                 if (!_w) { _x = value & 7; _t = (ushort)((_t & 0xFFE0) | (value >> 3)); _w = true; }
                 else { _t = (ushort)((_t & 0x8FFF) | ((value & 7) << 12)); _t = (ushort)((_t & 0xFC1F) | ((value & 0xF8) << 2)); _w = false; }
+                _vBaseCol = _renderX; // a fine-X / scroll change re-bases the origin for the rest of the line
                 break;
             case 6:
                 if (!_w) { _t = (ushort)((_t & 0x00FF) | ((value & 0x3F) << 8)); _w = true; }
                 else { _t = (ushort)((_t & 0xFF00) | value); _v = _t; _w = false; }
+                _vBaseCol = _renderX; // a mid-line v reload jumps the scroll from here on
                 break;
             case 7:
                 WriteVram((ushort)(_v & 0x3FFF), value);
@@ -362,13 +349,6 @@ public sealed class Ppu
     }
 
     // --- Loopy scroll updates ---
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void IncrementScrollX()
-    {
-        if ((_v & 0x001F) == 31) { _v = (ushort)(_v & ~0x001F); _v ^= 0x0400; }
-        else _v++;
-    }
 
     private void IncrementScrollY()
     {
@@ -387,7 +367,7 @@ public sealed class Ppu
         }
     }
 
-    private void CopyHorizontal() => _v = (ushort)((_v & 0x7BE0) | (_t & 0x041F));
+    private void CopyHorizontal() { _v = (ushort)((_v & 0x7BE0) | (_t & 0x041F)); _vBaseCol = 0; }
     private void CopyVertical() => _v = (ushort)((_v & 0x041F) | (_t & 0x7BE0));
 
     // --- VRAM access ---

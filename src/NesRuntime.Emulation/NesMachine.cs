@@ -105,6 +105,7 @@ public sealed class NesMachine : IBus
         }
         if (address <= 0x4017) { _apu.WriteRegister(address, value); RefreshIrq(); return; } // $4000-$4017 APU/frame counter
         if (address < 0x4020) return; // $4018-$401F: disabled test registers
+        _ppu.CatchUp();               // draw the current line up to now before CHR/mirroring may change
         _mapper.CpuWrite(address, value);
         RefreshIrq(); // a write may acknowledge ($E000) or (de)assert the mapper IRQ
     }
