@@ -15,6 +15,11 @@ public interface IMapper
     byte ChrRead(ushort address);      // PPU $0000-$1FFF
     void ChrWrite(ushort address, byte value);
 
+    // Battery-backed PRG-RAM ($6000-$7FFF). Only set when the iNES header marks the cartridge as
+    // battery-backed; the host persists <see cref="BatteryRam"/> to disk and restores it on load.
+    bool HasBattery => false;
+    Span<byte> BatteryRam => Span<byte>.Empty;
+
     // IRQ hooks. MMC3-style mappers count rendered scanlines (OnScanline); Sunsoft FME-7-style
     // mappers count CPU cycles (OnCpuCycles). Both drive IrqPending; unused ones get no-op defaults.
     bool IrqPending => false;
@@ -62,10 +67,13 @@ public sealed class NromMapper : IMapper
         _chrRam = rom.ChrIsRam;
         Mirroring = rom.Mirroring;
         _prgMask = _prg.Length > 0x4000 ? 0x7FFF : 0x3FFF;
+        HasBattery = rom.HasBattery;
     }
 
     public int Number => 0;
     public Mirroring Mirroring { get; }
+    public bool HasBattery { get; }
+    public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
     public byte CpuRead(ushort address)
     {
@@ -221,9 +229,12 @@ public sealed class Mmc1Mapper : IMapper
         _chr = rom.Chr.Length > 0 ? rom.Chr : new byte[0x2000];
         _prgBankCount = Math.Max(1, _prg.Length / 0x4000);
         _chrBankCount = Math.Max(1, _chr.Length / 0x1000);
+        HasBattery = rom.HasBattery;
     }
 
     public int Number => 1;
+    public bool HasBattery { get; }
+    public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
     public Mirroring Mirroring => (_control & 3) switch
     {
@@ -327,11 +338,14 @@ public sealed class Mmc3Mapper : IMapper
         _chrBanks1k = Math.Max(1, _chr.Length / 0x400);
         _fourScreen = rom.Mirroring == Mirroring.FourScreen;
         _mirroring = _fourScreen ? Mirroring.FourScreen : rom.Mirroring;
+        HasBattery = rom.HasBattery;
     }
 
     public int Number => 4;
     public Mirroring Mirroring => _mirroring;
     public bool IrqPending => _irqPending;
+    public bool HasBattery { get; }
+    public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
     public byte CpuRead(ushort address)
     {
@@ -505,11 +519,14 @@ public sealed class Fme7Mapper : IMapper
         _chrBanks1k = Math.Max(1, _chr.Length / 0x400);
         _mirroring = rom.Mirroring;
         _prgBank[3] = _prgBanks8k - 1; // sensible power-on default for the $C000 slot
+        HasBattery = rom.HasBattery;
     }
 
     public int Number => 69;
     public Mirroring Mirroring => _mirroring;
     public bool IrqPending => _irqPending;
+    public bool HasBattery { get; }
+    public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
     public byte CpuRead(ushort address)
     {
@@ -705,10 +722,13 @@ public sealed class Mmc4Mapper : IMapper
         _prgBanks16k = Math.Max(1, _prg.Length / 0x4000);
         _chrBanks4k = Math.Max(1, _chr.Length / 0x1000);
         _mirroring = rom.Mirroring;
+        HasBattery = rom.HasBattery;
     }
 
     public int Number => 10;
     public Mirroring Mirroring => _mirroring;
+    public bool HasBattery { get; }
+    public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
     public byte CpuRead(ushort address)
     {
@@ -844,11 +864,14 @@ public sealed class Vrc6Mapper : IMapper
         _prgBanks8k = Math.Max(1, _prg.Length / 0x2000);
         _chrBanks1k = Math.Max(1, _chr.Length / 0x400);
         _mirroring = rom.Mirroring;
+        HasBattery = rom.HasBattery;
     }
 
     public int Number => _number;
     public Mirroring Mirroring => _mirroring;
     public bool IrqPending => _irq.Pending;
+    public bool HasBattery { get; }
+    public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
     // A0/A1 register-select bits — swapped on VRC6b (mapper 26).
     private int Sub(ushort a) => _number == 26
@@ -945,11 +968,14 @@ public sealed class Vrc24Mapper : IMapper
         _prgBanks8k = Math.Max(1, _prg.Length / 0x2000);
         _chrBanks1k = Math.Max(1, _chr.Length / 0x400);
         _mirroring = rom.Mirroring;
+        HasBattery = rom.HasBattery;
     }
 
     public int Number => _number;
     public Mirroring Mirroring => _mirroring;
     public bool IrqPending => _isVrc4 && _irq.Pending;
+    public bool HasBattery { get; }
+    public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
     // Register-select bits, OR-ing every candidate address line for this mapper number.
     private int Sub(ushort a) => _number switch

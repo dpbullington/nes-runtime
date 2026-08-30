@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using NesRuntime.Core.Input;
 using NesRuntime.Maui.Controls;
 using NesRuntime.Maui.Games;
@@ -27,6 +28,11 @@ public partial class MainPage : ContentPage
     private bool _running;
     private IDispatcherTimer? _statusTimer;
 
+    // Actual (measured) frames-per-second, from the count of frames the view has presented.
+    private readonly Stopwatch _fpsClock = Stopwatch.StartNew();
+    private long _fpsLastFrame;
+    private double _fpsLastTime;
+
     public MainPage()
     {
         InitializeComponent();
@@ -37,8 +43,24 @@ public partial class MainPage : ContentPage
         _statusTimer = Dispatcher.CreateTimer();
         _statusTimer.Interval = TimeSpan.FromMilliseconds(150); // fast enough to watch button presses live
         _statusTimer.IsRepeating = true;
-        _statusTimer.Tick += (_, _) => UpdateControllerStatus();
+        _statusTimer.Tick += (_, _) => { UpdateControllerStatus(); UpdateFps(); };
         _statusTimer.Start();
+    }
+
+    // Measures real throughput: frames presented since the last update divided by elapsed time.
+    private void UpdateFps()
+    {
+        double now = _fpsClock.Elapsed.TotalSeconds;
+        double dt = now - _fpsLastTime;
+        if (dt < 0.5) // update ~twice a second so the reading is steady, not jittery
+            return;
+
+        long frames = _screen.FrameCount;
+        double fps = (frames - _fpsLastFrame) / dt;
+        _fpsLastFrame = frames;
+        _fpsLastTime = now;
+
+        FpsLabel.Text = _running ? $"{fps:F1} FPS  (target {NtscFps:F1})" : "— FPS";
     }
 
     private void UpdateControllerStatus()
@@ -60,6 +82,7 @@ public partial class MainPage : ContentPage
         if (_running)
         {
             _clock?.Stop();
+            EmulatorGame.FlushCurrent(); // persist battery-backed SRAM on stop
             _running = false;
             StatusLabel.Text = "Stopped.";
             return;
@@ -76,6 +99,7 @@ public partial class MainPage : ContentPage
         if (_running)
         {
             _clock?.Stop();
+            EmulatorGame.FlushCurrent(); // persist the outgoing game's SRAM before switching
             _running = false;
         }
 
@@ -121,6 +145,7 @@ public partial class MainPage : ContentPage
             }
 
             EmulatorGame.RomImage = rom;
+            EmulatorGame.RomName = Path.GetFileNameWithoutExtension(file.FileName);
             StartHost(
                 (v, a, i, c) => GameRunner.Create<EmulatorGame>(v, a, i, c, NesRuntime.Core.Region.Ntsc),
                 $"Running {file.FileName}");

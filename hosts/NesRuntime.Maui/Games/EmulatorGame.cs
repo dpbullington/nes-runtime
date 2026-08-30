@@ -24,7 +24,20 @@ public sealed class EmulatorGame : NesGame
     /// built-in test ROM.</summary>
     public static byte[]? RomImage;
 
+    /// <summary>The ROM file's name without extension (e.g. "Zelda"), used to key the battery-save
+    /// folder. Assign alongside <see cref="RomImage"/>.</summary>
+    public static string? RomName;
+
+    // The one running emulator instance, so the host can flush its battery on stop/quit.
+    private static EmulatorGame? _current;
+
+    // How often (in frames, ~60/s) to check the battery RAM for changes and flush it to disk.
+    private const int AutosaveIntervalFrames = 60;
+
     private NesMachine _machine = null!;
+    private string? _batteryPath;
+    private byte[] _lastBattery = [];
+    private int _framesSinceSave;
 
     public override GameInfo Info => new() { Title = "NES Emulator", Author = "NesRuntime", MaxPlayers = 2 };
 
@@ -32,13 +45,35 @@ public sealed class EmulatorGame : NesGame
     {
         byte[] image = RomImage ?? BuiltInTestRom();
         _machine = new NesMachine(INesRom.Parse(image));
+        _current = this;
+        _batteryPath = null;
+        _lastBattery = [];
+
+        // Only battery-backed cartridges persist their PRG-RAM; restore any prior save now.
+        if (_machine.HasBattery && !string.IsNullOrEmpty(RomName))
+        {
+            _batteryPath = BatteryPath(RomName!);
+            TryLoadBattery();
+        }
     }
 
     protected override void Update()
     {
         _machine.SetButtons(0, ReadPad(0));
         _machine.SetButtons(1, ReadPad(1));
+
+        // Autosave on change so an app force-quit loses at most ~1s of battery RAM.
+        if (_batteryPath is not null && ++_framesSinceSave >= AutosaveIntervalFrames)
+        {
+            _framesSinceSave = 0;
+            SaveBattery();
+        }
     }
+
+    /// <summary>Persists the running cartridge's battery RAM if it changed. Called by the host on stop.</summary>
+    public static void FlushCurrent() => _current?.SaveBattery();
+
+    protected override void Unload() => SaveBattery();
 
     protected override void Render() { }
 
@@ -67,6 +102,60 @@ public sealed class EmulatorGame : NesGame
         if (pad.IsDown(Button.Left)) b |= NesButton.Left;
         if (pad.IsDown(Button.Right)) b |= NesButton.Right;
         return b;
+    }
+
+    // --- Battery-backed SRAM persistence ---
+
+    private void TryLoadBattery()
+    {
+        try
+        {
+            if (_batteryPath is not null && File.Exists(_batteryPath))
+                _machine.LoadBattery(File.ReadAllBytes(_batteryPath));
+
+            _lastBattery = _machine.BatteryRam.ToArray(); // baseline so autosave only writes real changes
+        }
+        catch
+        {
+            // A missing/locked/corrupt save must never crash the game — just start from blank SRAM.
+        }
+    }
+
+    private void SaveBattery()
+    {
+        if (_batteryPath is null || !_machine.HasBattery)
+            return;
+
+        ReadOnlySpan<byte> ram = _machine.BatteryRam;
+        if (ram.SequenceEqual(_lastBattery))
+            return; // unchanged since the last flush — skip the write
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_batteryPath)!);
+            byte[] snapshot = ram.ToArray();
+            File.WriteAllBytes(_batteryPath, snapshot);
+            _lastBattery = snapshot;
+        }
+        catch
+        {
+            // Out of space / permission denied must not crash the game; retry on the next autosave.
+        }
+    }
+
+    // ~/.nes-runtime/save/<rom-name>/battery.bin. Under the app sandbox (Mac Catalyst) "~" is the app's
+    // container home, which is writable without extra entitlements.
+    private static string? BatteryPath(string romName)
+    {
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (string.IsNullOrEmpty(home))
+            return null;
+
+        string safe = string.Concat(romName.Split(Path.GetInvalidFileNameChars()));
+        if (string.IsNullOrWhiteSpace(safe))
+            safe = "rom";
+
+        return Path.Combine(home, ".nes-runtime", "save", safe, "battery.bin");
     }
 
     // A minimal NROM ROM: reset code writes a palette, fills the top tile rows with a boxed tile, and

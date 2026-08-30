@@ -4,9 +4,10 @@
              x:Class="NesRuntime.Maui.MainPage"
              BackgroundColor="Black">
 
-    <Grid RowDefinitions="*,Auto,Auto,Auto" Padding="0">
+    <Grid RowDefinitions="*,Auto,Auto,Auto,Auto" Padding="0">
 
-        <!-- The game screen (SkiaSharp canvas) is inserted here in code-behind. -->
+        <!-- The game screen (SkiaSharp canvas) is inserted here in code-behind. It fills this row,
+             which takes all remaining height (*), so the picture scales with the window size. -->
         <ContentView x:Name="ScreenHost" Grid.Row="0" />
 
         <Label x:Name="StatusLabel"
@@ -17,9 +18,19 @@
                HorizontalTextAlignment="Center"
                Text="Idle." />
 
+        <!-- Live frames-per-second, at the bottom of the game screen by the controller info. -->
+        <Label x:Name="FpsLabel"
+               Grid.Row="2"
+               Margin="12,2,12,0"
+               FontSize="13"
+               FontFamily="Monospace"
+               TextColor="#40D060"
+               HorizontalTextAlignment="Center"
+               Text="— FPS" />
+
         <!-- Controller connection status, refreshed by a timer in code-behind. -->
         <Label x:Name="ControllerStatusLabel"
-               Grid.Row="2"
+               Grid.Row="3"
                Margin="12,2,12,6"
                FontSize="12"
                TextColor="#8090A0"
@@ -27,7 +38,7 @@
                Text="" />
 
         <!-- On-screen controls are generated in code-behind and placed here. -->
-        <ContentView x:Name="ControlsHost" Grid.Row="3" Margin="12" />
+        <ContentView x:Name="ControlsHost" Grid.Row="4" Margin="12" />
 
     </Grid>
 

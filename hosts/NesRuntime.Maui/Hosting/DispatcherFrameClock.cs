@@ -1,22 +1,33 @@
 using NesRuntime.Rendering;
+#if MACCATALYST
+using CoreAnimation;
+using Foundation;
+#endif
 
 namespace NesRuntime.Maui.Hosting;
 
 /// <summary>
-/// An <see cref="IFrameClock"/> backed by the MAUI UI dispatcher. It ticks at the console's frame
-/// rate so the whole runtime loop (input poll → step → present) runs on the UI thread, which keeps
-/// framebuffer presentation and on-screen input trivially thread-safe for this host.
+/// An <see cref="IFrameClock"/> that paces the runtime on the UI thread. On Mac Catalyst it is driven
+/// by a display-synced <c>CADisplayLink</c> (fires once per vsync at the panel's refresh rate); on
+/// other platforms it falls back to a MAUI dispatcher timer.
 /// </summary>
 /// <remarks>
-/// A dispatcher timer is only approximately periodic; a production host would prefer a
-/// display-synced callback (CADisplayLink on Apple platforms, Choreographer on Android). This is
-/// deliberately the simple, portable option for the skeleton.
+/// A dispatcher timer schedules its next tick <em>interval</em> after the previous handler returns, so
+/// its real period is <c>interval + work</c> — at ~60 Hz that easily slips to ~50 fps once per-frame
+/// step+present work is added. <c>CADisplayLink</c> is scheduled by the display, not by the handler,
+/// so it holds the refresh rate regardless of how long a frame takes (short of dropping one).
 /// </remarks>
 public sealed class DispatcherFrameClock : IFrameClock
 {
     private readonly IDispatcher _dispatcher;
-    private IDispatcherTimer? _timer;
     private long _frame;
+
+#if MACCATALYST
+    private CADisplayLink? _displayLink;
+    private double _lastTimestamp;
+#else
+    private IDispatcherTimer? _timer;
+#endif
 
     public DispatcherFrameClock(IDispatcher dispatcher, double targetFps)
     {
@@ -30,6 +41,17 @@ public sealed class DispatcherFrameClock : IFrameClock
 
     public void Start()
     {
+#if MACCATALYST
+        if (_displayLink is not null)
+            return;
+
+        _lastTimestamp = 0;
+        _displayLink = CADisplayLink.Create(OnDisplayLink);
+        // Cap to the console rate; on a 60 Hz panel this is already the natural vsync cadence, and on
+        // a 120 Hz ProMotion panel it fires every other refresh instead of running the game double speed.
+        _displayLink.PreferredFramesPerSecond = (int)Math.Round(TargetFps);
+        _displayLink.AddToRunLoop(NSRunLoop.Main, NSRunLoopMode.Common);
+#else
         if (_timer is not null)
             return;
 
@@ -38,18 +60,38 @@ public sealed class DispatcherFrameClock : IFrameClock
         _timer.IsRepeating = true;
         _timer.Tick += OnTimerTick;
         _timer.Start();
+#endif
     }
 
     public void Stop()
     {
+#if MACCATALYST
+        if (_displayLink is null)
+            return;
+
+        _displayLink.Invalidate();
+        _displayLink.Dispose();
+        _displayLink = null;
+#else
         if (_timer is null)
             return;
 
         _timer.Stop();
         _timer.Tick -= OnTimerTick;
         _timer = null;
+#endif
     }
 
+#if MACCATALYST
+    private void OnDisplayLink()
+    {
+        double now = _displayLink!.Timestamp;
+        double delta = _lastTimestamp > 0 ? now - _lastTimestamp : 1.0 / TargetFps;
+        _lastTimestamp = now;
+        Tick?.Invoke(this, new FrameTick(_frame++, delta));
+    }
+#else
     private void OnTimerTick(object? sender, EventArgs e)
         => Tick?.Invoke(this, new FrameTick(_frame++, 1.0 / TargetFps));
+#endif
 }

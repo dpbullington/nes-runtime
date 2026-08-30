@@ -35,6 +35,20 @@ public sealed class NesMachine : IBus
 
     public Ppu Ppu => _ppu;
 
+    /// <summary>True when the cartridge has battery-backed PRG-RAM the host should persist.</summary>
+    public bool HasBattery => _mapper.HasBattery;
+
+    /// <summary>The current battery-backed PRG-RAM to save, or empty if the cartridge has none.</summary>
+    public ReadOnlySpan<byte> BatteryRam => _mapper.BatteryRam;
+
+    /// <summary>Restores battery-backed PRG-RAM from a previously saved image (truncated/zero-padded to fit).</summary>
+    public void LoadBattery(ReadOnlySpan<byte> data)
+    {
+        Span<byte> ram = _mapper.BatteryRam;
+        if (ram.IsEmpty || data.IsEmpty) return;
+        data[..Math.Min(data.Length, ram.Length)].CopyTo(ram);
+    }
+
     /// <summary>Copies this frame's synthesized audio into <paramref name="dest"/> (padded to fit).</summary>
     public void CopyAudio(Span<float> dest) => _apu.CopyAudio(dest);
 

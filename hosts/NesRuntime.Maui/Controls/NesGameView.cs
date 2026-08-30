@@ -23,9 +23,17 @@ public sealed class NesGameView : SKCanvasView
     private FrameBuffer? _pending;
     private MasterPalette? _palette;
 
+    /// <summary>Total frames presented so far — used by the host to compute the on-screen FPS.</summary>
+    public long FrameCount { get; private set; }
+
     public NesGameView()
     {
+        // Fill the available cell so the picture scales with the window; a size change repaints so the
+        // scaled image tracks the new bounds even while paused.
+        HorizontalOptions = LayoutOptions.Fill;
+        VerticalOptions = LayoutOptions.Fill;
         PaintSurface += OnPaintSurface;
+        SizeChanged += (_, _) => InvalidateSurface();
     }
 
     /// <summary>Accepts a new frame from the video backend and requests a repaint. Called on the
@@ -33,6 +41,7 @@ public sealed class NesGameView : SKCanvasView
     public void SubmitFrame(FrameBuffer frame)
     {
         _pending = frame;
+        FrameCount++;
         InvalidateSurface();
     }
 

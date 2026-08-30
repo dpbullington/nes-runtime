@@ -35,13 +35,15 @@ dotnet build -t:Run -c Release -f net10.0-maccatalyst hosts/NesRuntime.Maui/NesR
   Mac Catalyst is the verified-runnable target (builds 0/0). **Android/iOS targets were removed**
   because they need those platform SDKs; re-add `net10.0-android`/`net10.0-ios` to the host
   `<TargetFrameworks>` once the SDKs are installed.
-- **Run the emulator host in Release, not Debug.** The runtime loop runs on the UI thread
-  (`DispatcherFrameClock`), so a `StepFrame` that overruns the ~16.7 ms frame budget makes the
-  dispatcher-timer callbacks pile up and video/audio/input lag together. The `NesRuntime.Emulation`
-  core (per-pixel PPU + per-cycle APU) is a tight loop that the JIT only optimizes in Release: a
-  full-render frame is ~0.5 ms in Release (≈34× realtime) but ~2.4 ms in Debug (JIT skips
-  optimization/inlining), and Debug leaves little headroom once host present/audio/input overhead is
-  added. If it runs slow, check the run configuration is **Release** first.
+- **Run the emulator host in Release, not Debug.** The runtime loop runs on the UI thread (paced by
+  `DispatcherFrameClock`), so a `StepFrame` that overruns the ~16.7 ms frame budget starves the frame
+  clock and video/audio/input lag together. The `NesRuntime.Emulation` core (per-pixel PPU + per-cycle
+  APU) is a tight loop that the JIT only optimizes in Release: a full-render frame is ~0.5 ms in
+  Release (≈34× realtime) but ~2.4 ms in Debug (JIT skips optimization/inlining), and Debug leaves
+  little headroom once host present/audio/input overhead is added. If it runs slow, check the run
+  configuration is **Release** first. Note the *frame clock* itself is a separate concern: a plain
+  dispatcher timer caps at ~50 fps regardless of core speed (see `DispatcherFrameClock`), which is why
+  Mac Catalyst uses `CADisplayLink`.
 - Watch for **name collisions with MAUI's implicit usings** in host code: `Microsoft.Maui.Controls`
   is globally imported, so its `Button`/`Region`/etc. clash with `NesRuntime.Sdk.Input.Button` and
   `NesRuntime.Core.Region`. Disambiguate with a `using X = ...;` alias or full qualification (see
@@ -84,8 +86,11 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   (`MauiVideoBackend`→`NesGameView` SkiaSharp canvas, `MauiAudioBackend`, `MauiInputBackend` which
   merges on-screen controls + physical game controllers (Apple GameController `#if MACCATALYST`,
   `Windows.Gaming.Input` `#elif WINDOWS`) + keyboard on both platforms (GCKeyboard on Mac,
-  `InputKeyboardSource.GetKeyStateForCurrentThread` on Windows), `DispatcherFrameClock` on the UI
-  dispatcher) and wires them to a game via
+  `InputKeyboardSource.GetKeyStateForCurrentThread` on Windows), `DispatcherFrameClock` — a
+  display-synced `CADisplayLink` on Mac Catalyst (`#if MACCATALYST`), a MAUI dispatcher timer
+  elsewhere. A dispatcher timer reschedules *after* the handler returns, so its period is
+  `interval + work` and slips to ~50 fps at 60 Hz; `CADisplayLink` is paced by vsync and holds 60)
+  and wires them to a game via
   `GameRunner` in `MainPage`. The whole runtime loop runs on the UI thread by design, so
   presentation/input need no cross-thread marshaling. Pressing Start runs and renders the sample
   game; the try/catch around startup remains as a safety net for paths that are still stubbed.
@@ -100,6 +105,13 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   (`device.usb`). Use `files.user-selected.read-**write**` — MAUI's picker requests a read-write
   sandbox extension, so read-only fails with "couldn't issue sandbox extension …read-write". Without
   wiring the plist at all, the picker fails with "Failed to create an FPSandboxingURLWrapper".
+  **Battery saves:** for cartridges the header marks battery-backed, `EmulatorGame` restores PRG-RAM on
+  load and writes it to `~/.nes-runtime/save/<rom-name>/battery.bin` — autosaved on change (~1 s) and
+  flushed on stop (`EmulatorGame.FlushCurrent`, called by `MainPage`). `~` is
+  `Environment.SpecialFolder.UserProfile`, which under the App Sandbox is the app's *container* home
+  (`~/Library/Containers/…/Data`), writable without new entitlements; it becomes the literal
+  `/Users/<you>` only if the sandbox is disabled (which would break the ROM picker). All file I/O is
+  wrapped in try/catch so a missing/locked/corrupt save never crashes the game.
 - **`src/NesRuntime.Emulation`** — a self-contained NES execution core that runs real ROMs, distinct
   from the C# authoring SDK: `Mos6502` (full official **and** unofficial/illegal 6502 opcode set —
   LAX/SAX/DCP/ISC/SLO/RLA/SRE/RRA/ANC/ALR/ARR/SBX/undocumented NOPs + unstable stores — plus a
@@ -131,6 +143,9 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   change. FME-7's 5B and VRC6's expansion audio are accepted but not synthesized; VRC2/VRC4 register
   select bits are decoded by OR-ing every candidate address line (robust to iNES-1.0 submapper
   ambiguity).
+  Battery-backed cartridges expose their 8 KiB PRG-RAM for saving: `IMapper.HasBattery` (set from the
+  iNES header) + `IMapper.BatteryRam` (a `Span` over the `$6000` RAM, empty otherwise) surface through
+  `NesMachine.HasBattery`/`BatteryRam`/`LoadBattery` for the host to persist and restore.
   `INesRom` (iNES/NES 2.0 loader), and `NesMachine` (bus + controllers + per-frame step). The PPU
   fetches all CHR through `IMapper.ChrRead` and reads `IMapper.Mirroring` live, and the bus routes
   PRG through the mapper — so adding a (non-IRQ) mapper is just a new `IMapper` class, no PPU changes.
