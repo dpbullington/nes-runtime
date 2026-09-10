@@ -28,6 +28,10 @@ public sealed class EmulatorGame : NesGame
     /// folder. Assign alongside <see cref="RomImage"/>.</summary>
     public static string? RomName;
 
+    /// <summary>Human-readable outcome of the last battery restore/save, surfaced by the host so a
+    /// silent path/permission failure is visible rather than looking like "saves don't work".</summary>
+    public static string BatteryStatus = "";
+
     // The one running emulator instance, so the host can flush its battery on stop/quit.
     private static EmulatorGame? _current;
 
@@ -50,11 +54,19 @@ public sealed class EmulatorGame : NesGame
         _lastBattery = [];
 
         // Only battery-backed cartridges persist their PRG-RAM; restore any prior save now.
-        if (_machine.HasBattery && !string.IsNullOrEmpty(RomName))
+        if (!_machine.HasBattery)
         {
-            _batteryPath = BatteryPath(RomName!);
-            TryLoadBattery();
+            BatteryStatus = "cartridge is not battery-backed (iNES header bit clear) — no save";
+            return;
         }
+        if (string.IsNullOrEmpty(RomName))
+        {
+            BatteryStatus = "no ROM name set — cannot locate save folder";
+            return;
+        }
+
+        _batteryPath = ResolveBatteryPath(RomName!);
+        TryLoadBattery();
     }
 
     protected override void Update()
@@ -108,16 +120,31 @@ public sealed class EmulatorGame : NesGame
 
     private void TryLoadBattery()
     {
+        if (_batteryPath is null)
+        {
+            BatteryStatus = "no writable profile directory found for saves";
+            return;
+        }
+
         try
         {
-            if (_batteryPath is not null && File.Exists(_batteryPath))
-                _machine.LoadBattery(File.ReadAllBytes(_batteryPath));
+            if (File.Exists(_batteryPath))
+            {
+                byte[] data = File.ReadAllBytes(_batteryPath);
+                _machine.LoadBattery(data);
+                BatteryStatus = $"restored {data.Length} B — {_batteryPath}";
+            }
+            else
+            {
+                BatteryStatus = $"no save yet — {_batteryPath}";
+            }
 
             _lastBattery = _machine.BatteryRam.ToArray(); // baseline so autosave only writes real changes
         }
-        catch
+        catch (Exception ex)
         {
             // A missing/locked/corrupt save must never crash the game — just start from blank SRAM.
+            BatteryStatus = $"load error: {ex.Message} — {_batteryPath}";
         }
     }
 
@@ -136,26 +163,49 @@ public sealed class EmulatorGame : NesGame
             byte[] snapshot = ram.ToArray();
             File.WriteAllBytes(_batteryPath, snapshot);
             _lastBattery = snapshot;
+            BatteryStatus = $"saved {snapshot.Length} B — {_batteryPath}";
         }
-        catch
+        catch (Exception ex)
         {
             // Out of space / permission denied must not crash the game; retry on the next autosave.
+            BatteryStatus = $"save error: {ex.Message} — {_batteryPath}";
         }
     }
 
-    // ~/.nes-runtime/save/<rom-name>/battery.bin. Under the app sandbox (Mac Catalyst) "~" is the app's
-    // container home, which is writable without extra entitlements.
-    private static string? BatteryPath(string romName)
+    // ~/.nes-runtime/save/<rom-name>/battery.bin. Tries the user profile home first (honoring "~");
+    // if that isn't writable — e.g. the App Sandbox denies the real home — it falls back to the app's
+    // guaranteed-writable data container, keeping the same folder shape. Returns the first base whose
+    // directory it can actually create (the create doubles as a writability probe).
+    private static string? ResolveBatteryPath(string romName)
     {
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (string.IsNullOrEmpty(home))
-            return null;
-
         string safe = string.Concat(romName.Split(Path.GetInvalidFileNameChars()));
         if (string.IsNullOrWhiteSpace(safe))
             safe = "rom";
 
-        return Path.Combine(home, ".nes-runtime", "save", safe, "battery.bin");
+        foreach (string? baseDir in SaveBaseCandidates())
+        {
+            if (string.IsNullOrEmpty(baseDir))
+                continue;
+            try
+            {
+                string dir = Path.Combine(baseDir, ".nes-runtime", "save", safe);
+                Directory.CreateDirectory(dir); // also probes that this base is writable
+                return Path.Combine(dir, "battery.bin");
+            }
+            catch
+            {
+                // Not writable (sandbox/permissions) — try the next candidate.
+            }
+        }
+        return null;
+    }
+
+    private static IEnumerable<string?> SaveBaseCandidates()
+    {
+        yield return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        yield return Environment.GetEnvironmentVariable("HOME");
+        yield return FileSystem.AppDataDirectory;                                 // sandbox-safe container
+        yield return Environment.GetFolderPath(Environment.SpecialFolder.Personal); // Documents
     }
 
     // A minimal NROM ROM: reset code writes a palette, fills the top tile rows with a boxed tile, and

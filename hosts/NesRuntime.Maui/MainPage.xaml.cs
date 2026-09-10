@@ -26,6 +26,7 @@ public partial class MainPage : ContentPage
     private DispatcherFrameClock? _clock;
     private RuntimeHost? _host;
     private bool _running;
+    private bool _showBattery;      // true while the ROM emulator (not the sample game) is running
     private IDispatcherTimer? _statusTimer;
 
     // Actual (measured) frames-per-second, from the count of frames the view has presented.
@@ -43,8 +44,18 @@ public partial class MainPage : ContentPage
         _statusTimer = Dispatcher.CreateTimer();
         _statusTimer.Interval = TimeSpan.FromMilliseconds(150); // fast enough to watch button presses live
         _statusTimer.IsRepeating = true;
-        _statusTimer.Tick += (_, _) => { UpdateControllerStatus(); UpdateFps(); };
+        _statusTimer.Tick += (_, _) => { UpdateControllerStatus(); UpdateFps(); UpdateBatteryStatus(); };
         _statusTimer.Start();
+    }
+
+    // Surfaces the battery restore/save outcome (path, byte count, or the real error) in its own always-
+    // visible label — set unconditionally each tick (like the FPS readout) so a silent sandbox/path
+    // failure, or an old build without this code, is obvious instead of looking like "saves don't load".
+    private void UpdateBatteryStatus()
+    {
+        BatteryLabel.Text = _showBattery
+            ? (EmulatorGame.BatteryStatus.Length > 0 ? $"🔋 {EmulatorGame.BatteryStatus}" : "🔋 battery: waiting…")
+            : "🔋 battery: load a .nes cartridge to use saves";
     }
 
     // Measures real throughput: frames presented since the last update divided by elapsed time.
@@ -89,6 +100,7 @@ public partial class MainPage : ContentPage
         }
 
         // The sample game. (Swap for HelloNesGame; use "Load ROM…" to run a real cartridge.)
+        _showBattery = false; // the sample game has no cartridge battery
         StartHost((v, a, i, c) => GameRunner.Create<BreakoutGame>(v, a, i, c, NesRuntime.Core.Region.Ntsc), "Running.");
     }
 
@@ -146,9 +158,12 @@ public partial class MainPage : ContentPage
 
             EmulatorGame.RomImage = rom;
             EmulatorGame.RomName = Path.GetFileNameWithoutExtension(file.FileName);
+            EmulatorGame.BatteryStatus = "";
+            _showBattery = true; // BatteryLabel now shows the restore/save status (refreshed by the timer)
             StartHost(
                 (v, a, i, c) => GameRunner.Create<EmulatorGame>(v, a, i, c, NesRuntime.Core.Region.Ntsc),
                 $"Running {file.FileName}");
+            UpdateBatteryStatus(); // reflect the restore outcome immediately, not on the next tick
         }
         catch (Exception ex)
         {

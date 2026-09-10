@@ -29,6 +29,10 @@ dotnet build -t:Run -c Release -f net10.0-maccatalyst hosts/NesRuntime.Maui/NesR
 
 - Requires the **.NET 10 SDK** (10.x installed). The solution file is the newer **`.slnx`** format
   (`NesRuntime.slnx`), not `.sln`.
+- **`global.json` pins the SDK to the 10.0.30x band** (`rollForward: latestPatch`). The `maccatalyst`
+  workload is only installed for that band; a newer SDK (e.g. 10.0.400) fails the host build with
+  `NETSDK1147: workloads must be installed`. If you upgrade the pin, run `dotnet workload restore`
+  first so the Mac Catalyst workload is present for the new band.
 - The **MAUI workload is installed** in this environment. The host targets **desktop only** — Mac
   Catalyst on macOS, Windows on Windows (each conditioned by OS). So `dotnet build NesRuntime.slnx`
   and Rider's solution build succeed on either without the Android SDK or Xcode iOS simulators.
@@ -106,12 +110,15 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   sandbox extension, so read-only fails with "couldn't issue sandbox extension …read-write". Without
   wiring the plist at all, the picker fails with "Failed to create an FPSandboxingURLWrapper".
   **Battery saves:** for cartridges the header marks battery-backed, `EmulatorGame` restores PRG-RAM on
-  load and writes it to `~/.nes-runtime/save/<rom-name>/battery.bin` — autosaved on change (~1 s) and
-  flushed on stop (`EmulatorGame.FlushCurrent`, called by `MainPage`). `~` is
-  `Environment.SpecialFolder.UserProfile`, which under the App Sandbox is the app's *container* home
-  (`~/Library/Containers/…/Data`), writable without new entitlements; it becomes the literal
-  `/Users/<you>` only if the sandbox is disabled (which would break the ROM picker). All file I/O is
-  wrapped in try/catch so a missing/locked/corrupt save never crashes the game.
+  load and writes it to `<base>/.nes-runtime/save/<rom-name>/battery.bin` — autosaved on change (~1 s)
+  and flushed on stop (`EmulatorGame.FlushCurrent`, called by `MainPage`). `ResolveBatteryPath` picks
+  the first *writable* `<base>` from `UserProfile` → `$HOME` → **`FileSystem.AppDataDirectory`** →
+  Documents, probing each by trying to create the folder — so under the App Sandbox (where the real
+  `/Users/<you>` home is denied) it lands in the app's writable container instead of silently failing.
+  The chosen path + byte count (or the real error) is surfaced in `EmulatorGame.BatteryStatus`, which
+  `MainPage` shows on the status line (`🔋 …`) so a header-not-battery / path-denied case is visible
+  rather than looking like "saves don't load". All file I/O is wrapped in try/catch so a
+  missing/locked/corrupt save never crashes the game.
 - **`src/NesRuntime.Emulation`** — a self-contained NES execution core that runs real ROMs, distinct
   from the C# authoring SDK: `Mos6502` (full official **and** unofficial/illegal 6502 opcode set —
   LAX/SAX/DCP/ISC/SLO/RLA/SRE/RRA/ANC/ALR/ARR/SBX/undocumented NOPs + unstable stores — plus a
