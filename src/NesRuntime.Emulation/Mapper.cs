@@ -12,8 +12,15 @@ public interface IMapper
     byte CpuRead(ushort address);
     void CpuWrite(ushort address, byte value);
 
-    byte ChrRead(ushort address);      // PPU $0000-$1FFF
+    byte ChrRead(ushort address);      // PPU $0000-$1FFF (background/VRAM fetches)
     void ChrWrite(ushort address, byte value);
+
+    /// <summary>CHR fetch for a sprite pattern. Defaults to <see cref="ChrRead"/>; MMC5 overrides it to
+    /// select its sprite CHR bank set (distinct from background CHR in 8×16 sprite mode).</summary>
+    byte ChrReadSprite(ushort address) => ChrRead(address);
+
+    /// <summary>Snoops CPU writes to PPUCTRL ($2000). Default no-op; MMC5 uses it to track 8×16 sprite mode.</summary>
+    void OnPpuCtrl(byte value) { }
 
     // Battery-backed PRG-RAM ($6000-$7FFF). Only set when the iNES header marks the cartridge as
     // battery-backed; the host persists <see cref="BatteryRam"/> to disk and restores it on load.
@@ -40,18 +47,21 @@ public interface IMapper
         2 => new UxRomMapper(rom),
         3 => new CnRomMapper(rom),
         4 => new Mmc3Mapper(rom),
+        5 => new Mmc5Mapper(rom),
         7 => new AxRomMapper(rom),
         9 => new Mmc2Mapper(rom),
         10 => new Mmc4Mapper(rom),
         11 => new ColorDreamsMapper(rom),
+        19 => new Namco163Mapper(rom),
         21 or 22 or 23 or 25 => new Vrc24Mapper(rom),
         24 or 26 => new Vrc6Mapper(rom),
         66 => new GxRomMapper(rom),
         69 => new Fme7Mapper(rom),
+        85 => new Vrc7Mapper(rom),
         _ => throw new NotSupportedException(
             $"Mapper {rom.MapperNumber} is not supported yet " +
-            "(have: 0/NROM, 1/MMC1, 2/UxROM, 3/CNROM, 4/MMC3, 7/AxROM, 9/MMC2, 10/MMC4, " +
-            "11/ColorDreams, 21-26/Konami VRC2·VRC4·VRC6, 66/GxROM, 69/FME-7)."),
+            "(have: 0/NROM, 1/MMC1, 2/UxROM, 3/CNROM, 4/MMC3, 5/MMC5, 7/AxROM, 9/MMC2, 10/MMC4, " +
+            "11/ColorDreams, 19/Namco163, 21-26/Konami VRC2·VRC4·VRC6, 66/GxROM, 69/FME-7, 85/VRC7)."),
     };
 }
 
@@ -1297,4 +1307,384 @@ internal sealed class Sunsoft5BAudio
             if (_toneDisabled[ch] || _phase[ch]) sum += VolTable[_vol[ch]]; // tone-disable forces the level through
         return sum * (0.4f / 3f);
     }
+}
+
+/// <summary>
+/// Konami VRC7 (mapper 85 — Lagrange Point). Two switchable 8 KiB PRG banks at $8000/$A000 plus one
+/// at $C000 ($E000 fixed to the last bank), eight 1 KiB CHR banks, runtime mirroring, and the shared
+/// <see cref="VrcIrq"/>. The on-chip YM2413-derived FM synth ($9010/$9030) is accepted but not
+/// synthesized (a 2-operator FM core is a separate effort).
+/// </summary>
+public sealed class Vrc7Mapper : IMapper
+{
+    private readonly byte[] _prg, _chr;
+    private readonly bool _chrRam;
+    private readonly byte[] _prgRam = new byte[0x2000];
+    private readonly int _prgBanks8k, _chrBanks1k;
+    private readonly int[] _prgReg = new int[3];
+    private readonly int[] _chrReg = new int[8];
+    private readonly VrcIrq _irq = new();
+    private Mirroring _mirroring;
+
+    public Vrc7Mapper(INesRom rom)
+    {
+        _prg = rom.Prg;
+        _chrRam = rom.ChrIsRam;
+        _chr = rom.Chr.Length > 0 ? rom.Chr : new byte[0x2000];
+        _prgBanks8k = Math.Max(1, _prg.Length / 0x2000);
+        _chrBanks1k = Math.Max(1, _chr.Length / 0x400);
+        _mirroring = rom.Mirroring;
+        HasBattery = rom.HasBattery;
+    }
+
+    public int Number => 85;
+    public Mirroring Mirroring => _mirroring;
+    public bool IrqPending => _irq.Pending;
+    public bool HasBattery { get; }
+    public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
+
+    public byte CpuRead(ushort address)
+    {
+        if (address is >= 0x6000 and < 0x8000) return _prgRam[address - 0x6000];
+        if (address < 0x8000) return 0;
+        int bank = (address & 0xE000) switch
+        {
+            0x8000 => _prgReg[0],
+            0xA000 => _prgReg[1],
+            0xC000 => _prgReg[2],
+            _ => _prgBanks8k - 1,
+        };
+        return _prg[(bank % _prgBanks8k) * 0x2000 + (address & 0x1FFF)];
+    }
+
+    public void CpuWrite(ushort address, byte value)
+    {
+        if (address is >= 0x6000 and < 0x8000) { _prgRam[address - 0x6000] = value; return; }
+        if (address < 0x8000) return;
+
+        bool hi = (address & 0x10) != 0; // A4 selects the second register in each $x000 group
+        switch (address & 0xF000)
+        {
+            case 0x8000: _prgReg[hi ? 1 : 0] = value & 0x3F; break;
+            case 0x9000: if (!hi) _prgReg[2] = value & 0x3F; break; // $9010/$9030: FM audio, not synthesized
+            case 0xA000: _chrReg[hi ? 1 : 0] = value; break;
+            case 0xB000: _chrReg[hi ? 3 : 2] = value; break;
+            case 0xC000: _chrReg[hi ? 5 : 4] = value; break;
+            case 0xD000: _chrReg[hi ? 7 : 6] = value; break;
+            case 0xE000: if (!hi) _mirroring = MirrorOf(value); else _irq.WriteLatch8(value); break;
+            case 0xF000: if (!hi) _irq.WriteControl(value); else _irq.Acknowledge(); break;
+        }
+    }
+
+    public void OnCpuCycles(int cycles) => _irq.Clock(cycles);
+
+    public byte ChrRead(ushort address) => _chr[(_chrReg[(address >> 10) & 7] % _chrBanks1k) * 0x400 + (address & 0x3FF)];
+    public void ChrWrite(ushort address, byte value)
+    {
+        if (_chrRam) _chr[(_chrReg[(address >> 10) & 7] % _chrBanks1k) * 0x400 + (address & 0x3FF)] = value;
+    }
+
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(_prgReg); s.Transfer(_chrReg);
+        s.Transfer(ref _mirroring);
+        _irq.SerializeState(s);
+        s.TransferBytes(_prgRam);
+        if (_chrRam) s.TransferBytes(_chr);
+    }
+
+    private static Mirroring MirrorOf(byte v) => (v & 3) switch
+    {
+        0 => Mirroring.Vertical, 1 => Mirroring.Horizontal, 2 => Mirroring.SingleScreenLower, _ => Mirroring.SingleScreenUpper,
+    };
+}
+
+/// <summary>
+/// Namco 163 (mapper 19). Three switchable 8 KiB PRG banks ($E000/$E800/$F000) with the last bank
+/// fixed at $E000, eight 1 KiB CHR banks, a 15-bit CPU-cycle up-counter IRQ, and nametable-select
+/// registers from which mirroring is derived (values ≥ $E0 map to internal CIRAM 0/1). The 8-channel
+/// wavetable expansion audio and CHR-ROM-as-nametable are not modeled.
+/// </summary>
+public sealed class Namco163Mapper : IMapper
+{
+    private readonly byte[] _prg, _chr;
+    private readonly bool _chrRam;
+    private readonly byte[] _prgRam = new byte[0x2000];
+    private readonly int _prgBanks8k, _chrBanks1k;
+    private readonly int[] _prgReg = new int[3];
+    private readonly int[] _chrReg = new int[8];
+    private readonly int[] _ntReg = new int[4];
+    private int _irqCounter;
+    private bool _irqEnabled, _irqPending;
+
+    public Namco163Mapper(INesRom rom)
+    {
+        _prg = rom.Prg;
+        _chrRam = rom.ChrIsRam;
+        _chr = rom.Chr.Length > 0 ? rom.Chr : new byte[0x2000];
+        _prgBanks8k = Math.Max(1, _prg.Length / 0x2000);
+        _chrBanks1k = Math.Max(1, _chr.Length / 0x400);
+        HasBattery = rom.HasBattery;
+    }
+
+    public int Number => 19;
+    public bool HasBattery { get; }
+    public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
+    public bool IrqPending => _irqPending;
+
+    public Mirroring Mirroring
+    {
+        get
+        {
+            int p0 = Page(_ntReg[0]), p1 = Page(_ntReg[1]), p2 = Page(_ntReg[2]), p3 = Page(_ntReg[3]);
+            if (p0 == 0 && p1 == 1 && p2 == 0 && p3 == 1) return Mirroring.Vertical;
+            if (p0 == 0 && p1 == 0 && p2 == 1 && p3 == 1) return Mirroring.Horizontal;
+            if (p0 == 1 && p1 == 1 && p2 == 1 && p3 == 1) return Mirroring.SingleScreenUpper;
+            if (p0 == 0 && p1 == 0 && p2 == 0 && p3 == 0) return Mirroring.SingleScreenLower;
+            return Mirroring.Vertical;
+        }
+    }
+    private static int Page(int reg) => reg >= 0xE0 ? reg & 1 : 0;
+
+    public byte CpuRead(ushort address)
+    {
+        if (address is >= 0x6000 and < 0x8000) return _prgRam[address - 0x6000];
+        if (address < 0x8000) return 0;
+        int bank = (address & 0xE000) switch
+        {
+            0x8000 => _prgReg[0],
+            0xA000 => _prgReg[1],
+            0xC000 => _prgReg[2],
+            _ => _prgBanks8k - 1,
+        };
+        return _prg[(bank % _prgBanks8k) * 0x2000 + (address & 0x1FFF)];
+    }
+
+    public void CpuWrite(ushort address, byte value)
+    {
+        if (address is >= 0x6000 and < 0x8000) { _prgRam[address - 0x6000] = value; return; }
+        if (address is >= 0x5000 and < 0x5800) { _irqCounter = (_irqCounter & 0x7F00) | value; _irqPending = false; return; }
+        if (address is >= 0x5800 and < 0x6000) { _irqCounter = (_irqCounter & 0x00FF) | ((value & 0x7F) << 8); _irqEnabled = (value & 0x80) != 0; _irqPending = false; return; }
+        if (address < 0x8000) return; // $4800 audio data / other ports not modeled
+
+        switch (address & 0xF800)
+        {
+            case 0x8000: _chrReg[0] = value; break;
+            case 0x8800: _chrReg[1] = value; break;
+            case 0x9000: _chrReg[2] = value; break;
+            case 0x9800: _chrReg[3] = value; break;
+            case 0xA000: _chrReg[4] = value; break;
+            case 0xA800: _chrReg[5] = value; break;
+            case 0xB000: _chrReg[6] = value; break;
+            case 0xB800: _chrReg[7] = value; break;
+            case 0xC000: _ntReg[0] = value; break;
+            case 0xC800: _ntReg[1] = value; break;
+            case 0xD000: _ntReg[2] = value; break;
+            case 0xD800: _ntReg[3] = value; break;
+            case 0xE000: _prgReg[0] = value & 0x3F; break;
+            case 0xE800: _prgReg[1] = value & 0x3F; break;
+            case 0xF000: _prgReg[2] = value & 0x3F; break;
+            // $F800: sound address latch — not modeled
+        }
+    }
+
+    public void OnCpuCycles(int cycles)
+    {
+        if (!_irqEnabled) return;
+        for (int i = 0; i < cycles; i++)
+            if (_irqCounter < 0x7FFF && ++_irqCounter == 0x7FFF) _irqPending = true; // stops + fires at 0x7FFF
+    }
+
+    public byte ChrRead(ushort address) => _chr[(_chrReg[(address >> 10) & 7] % _chrBanks1k) * 0x400 + (address & 0x3FF)];
+    public void ChrWrite(ushort address, byte value)
+    {
+        if (_chrRam) _chr[(_chrReg[(address >> 10) & 7] % _chrBanks1k) * 0x400 + (address & 0x3FF)] = value;
+    }
+
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(_prgReg); s.Transfer(_chrReg); s.Transfer(_ntReg);
+        s.Transfer(ref _irqCounter); s.Transfer(ref _irqEnabled); s.Transfer(ref _irqPending);
+        s.TransferBytes(_prgRam);
+        if (_chrRam) s.TransferBytes(_chr);
+    }
+}
+
+/// <summary>
+/// MMC5 (mapper 5 — Castlevania III (US), etc.) — a <b>partial</b> implementation covering the parts
+/// most games need: the four PRG banking modes (ROM/RAM select), the four CHR modes with the separate
+/// sprite (A) / background (B) register sets used in 8×16 mode, the $5205/$5206 multiplier, and the
+/// scanline-compare IRQ (approximated per rendered scanline via <see cref="OnScanline"/>). Nametable
+/// control is reduced to standard mirroring from $5105; ExRAM-as-nametable, fill mode, the vertical
+/// split, extended-attribute CHR, and the MMC5 sound channels are <b>not</b> modeled.
+/// </summary>
+public sealed class Mmc5Mapper : IMapper
+{
+    private readonly byte[] _prg, _chr;
+    private readonly bool _chrRam;
+    private readonly byte[] _prgRam = new byte[0x2000];
+    private readonly byte[] _exram = new byte[0x400];
+    private readonly int _prgBanks8k, _chrBanks1k;
+
+    private int _prgMode = 3, _chrMode = 3, _chrUpper;
+    private readonly int[] _prgBank = new int[4]; // $5114-$5117 (bit7 = ROM select; bits 0-6 = bank)
+    private readonly int[] _chrA = new int[8];     // $5120-$5127 (sprite / 8x8)
+    private readonly int[] _chrB = new int[4];     // $5128-$512B (background in 8x16)
+    private bool _usedB;                            // last CHR set written (for 8x8 mode)
+    private bool _sprite16;                         // from PPUCTRL snoop
+    private int _multA = 0xFF, _multB = 0xFF;
+    private Mirroring _mirroring;
+
+    private int _irqTarget, _irqScanline;
+    private bool _irqEnabled, _irqPending;
+
+    public Mmc5Mapper(INesRom rom)
+    {
+        _prg = rom.Prg;
+        _chrRam = rom.ChrIsRam;
+        _chr = rom.Chr.Length > 0 ? rom.Chr : new byte[0x2000];
+        _prgBanks8k = Math.Max(1, _prg.Length / 0x2000);
+        _chrBanks1k = Math.Max(1, _chr.Length / 0x400);
+        _mirroring = rom.Mirroring;
+        HasBattery = rom.HasBattery;
+        _prgBank[3] = (_prgBanks8k - 1) | 0x80; // $5117 is always ROM, power-on to last bank
+    }
+
+    public int Number => 5;
+    public Mirroring Mirroring => _mirroring;
+    public bool HasBattery { get; }
+    public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
+    public bool IrqPending => _irqPending;
+
+    public void OnPpuCtrl(byte value) => _sprite16 = (value & 0x20) != 0;
+
+    public byte CpuRead(ushort address)
+    {
+        switch (address)
+        {
+            case 0x5204: { byte s = (byte)(_irqPending ? 0x80 : 0); _irqPending = false; return s; }
+            case 0x5205: return (byte)((_multA * _multB) & 0xFF);
+            case 0x5206: return (byte)(((_multA * _multB) >> 8) & 0xFF);
+        }
+        if (address is >= 0x5C00 and < 0x6000) return _exram[address - 0x5C00];
+        if (address is >= 0x6000 and < 0x8000) return _prgRam[address - 0x6000];
+        if (address < 0x8000) return 0;
+
+        int slot = ((address - 0x8000) >> 13) & 3; // 0..3 for $8000/$A000/$C000/$E000
+        (int bank8k, bool rom) = PrgInfo(slot);
+        if (!rom) return _prgRam[address & 0x1FFF];
+        return _prg[(bank8k % _prgBanks8k) * 0x2000 + (address & 0x1FFF)];
+    }
+
+    public void CpuWrite(ushort address, byte value)
+    {
+        if (address is >= 0x5C00 and < 0x6000) { _exram[address - 0x5C00] = value; return; }
+        if (address is >= 0x6000 and < 0x8000) { _prgRam[address - 0x6000] = value; return; }
+
+        switch (address)
+        {
+            case 0x5100: _prgMode = value & 3; return;
+            case 0x5101: _chrMode = value & 3; return;
+            case 0x5105: _mirroring = MirrorOf(value); return;
+            case 0x5114: case 0x5115: case 0x5116: case 0x5117:
+                _prgBank[address - 0x5114] = value; return;
+            case 0x5120: case 0x5121: case 0x5122: case 0x5123:
+            case 0x5124: case 0x5125: case 0x5126: case 0x5127:
+                _chrA[address - 0x5120] = value | (_chrUpper << 8); _usedB = false; return;
+            case 0x5128: case 0x5129: case 0x512A: case 0x512B:
+                _chrB[address - 0x5128] = value | (_chrUpper << 8); _usedB = true; return;
+            case 0x5130: _chrUpper = value & 3; return;
+            case 0x5203: _irqTarget = value; return;
+            case 0x5204: _irqEnabled = (value & 0x80) != 0; return;
+            case 0x5205: _multA = value; return;
+            case 0x5206: _multB = value; return;
+        }
+    }
+
+    public void OnScanline()
+    {
+        if (++_irqScanline > 240) _irqScanline = 0; // approximate per-frame reset (no PPU-read detection)
+        if (_irqScanline == _irqTarget && _irqEnabled) _irqPending = true;
+    }
+
+    public byte ChrRead(ushort address) => _chr[(ChrBank(address, background: true) % _chrBanks1k) * 0x400 + (address & 0x3FF)];
+    public byte ChrReadSprite(ushort address) => _chr[(ChrBank(address, background: false) % _chrBanks1k) * 0x400 + (address & 0x3FF)];
+    public void ChrWrite(ushort address, byte value)
+    {
+        if (_chrRam) _chr[(ChrBank(address, background: true) % _chrBanks1k) * 0x400 + (address & 0x3FF)] = value;
+    }
+
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(ref _prgMode); s.Transfer(ref _chrMode); s.Transfer(ref _chrUpper);
+        s.Transfer(_prgBank); s.Transfer(_chrA); s.Transfer(_chrB);
+        s.Transfer(ref _usedB); s.Transfer(ref _sprite16);
+        s.Transfer(ref _multA); s.Transfer(ref _multB);
+        s.Transfer(ref _mirroring);
+        s.Transfer(ref _irqTarget); s.Transfer(ref _irqScanline);
+        s.Transfer(ref _irqEnabled); s.Transfer(ref _irqPending);
+        s.TransferBytes(_prgRam); s.TransferBytes(_exram);
+        if (_chrRam) s.TransferBytes(_chr);
+    }
+
+    // PRG slot (0..3 = $8000/$A000/$C000/$E000) -> (8 KiB bank, isRom) under the current PRG mode.
+    // Bit 7 of a bank register is the ROM(1)/RAM(0) select; $5117 (reg 3) is always ROM.
+    private (int bank, bool rom) PrgInfo(int slot)
+    {
+        bool Rom(int reg) => (reg & 0x80) != 0;
+        int B(int reg) => reg & 0x7F;
+        switch (_prgMode)
+        {
+            case 0: // one 32 KiB ROM bank ($5117)
+                return ((B(_prgBank[3]) & ~3) + slot, true);
+            case 1: // two 16 KiB: $8000 from $5115, $C000 from $5117
+                return slot < 2
+                    ? ((B(_prgBank[1]) & ~1) + (slot & 1), Rom(_prgBank[1]))
+                    : ((B(_prgBank[3]) & ~1) + (slot & 1), true);
+            case 2: // 16 KiB ($5115) + 8 KiB ($5116) + 8 KiB ($5117)
+                return slot switch
+                {
+                    0 or 1 => ((B(_prgBank[1]) & ~1) + (slot & 1), Rom(_prgBank[1])),
+                    2 => (B(_prgBank[2]), Rom(_prgBank[2])),
+                    _ => (B(_prgBank[3]), true),
+                };
+            default: // mode 3: four 8 KiB ($5114-$5117)
+                return (B(_prgBank[slot]), slot == 3 || Rom(_prgBank[slot]));
+        }
+    }
+
+    // 1 KiB CHR bank for a PPU address. In 8x16 mode sprite fetches use set A and background set B;
+    // in 8x8 mode both use whichever set was written last.
+    private int ChrBank(ushort address, bool background)
+    {
+        int r = (address >> 10) & 7;
+        int[] set = _sprite16 ? (background ? Bset() : _chrA) : (_usedB ? Bset() : _chrA);
+        return BankFor(set, r);
+    }
+
+    // Set B only has four registers; mirror them across the eight 1 KiB regions.
+    private int[] Bset()
+    {
+        _bsetScratch[0] = _chrB[0]; _bsetScratch[1] = _chrB[1]; _bsetScratch[2] = _chrB[2]; _bsetScratch[3] = _chrB[3];
+        _bsetScratch[4] = _chrB[0]; _bsetScratch[5] = _chrB[1]; _bsetScratch[6] = _chrB[2]; _bsetScratch[7] = _chrB[3];
+        return _bsetScratch;
+    }
+    private readonly int[] _bsetScratch = new int[8];
+
+    private int BankFor(int[] set, int r) => _chrMode switch
+    {
+        0 => set[7] * 8 + r,                 // 8 KiB
+        1 => set[r < 4 ? 3 : 7] * 4 + (r & 3), // 4 KiB
+        2 => set[r | 1] * 2 + (r & 1),        // 2 KiB
+        _ => set[r],                          // 1 KiB
+    };
+
+    private static Mirroring MirrorOf(byte v) => (v & 3) switch
+    {
+        // $5105 is per-quadrant; reduce the common whole-screen cases to a standard enum.
+        0 => Mirroring.SingleScreenLower,
+        1 => Mirroring.Vertical,
+        2 => Mirroring.Horizontal,
+        _ => Mirroring.SingleScreenUpper,
+    };
 }

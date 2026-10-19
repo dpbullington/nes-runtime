@@ -141,7 +141,12 @@ public sealed class NesMachine : IBus
     public void Write(ushort address, byte value)
     {
         if (address < 0x2000) { _ram[address & 0x07FF] = value; return; }
-        if (address < 0x4000) { _ppu.WriteRegister(address & 7, value); return; }
+        if (address < 0x4000)
+        {
+            if ((address & 7) == 0) _mapper.OnPpuCtrl(value); // MMC5 snoops PPUCTRL for 8x16 sprite mode
+            _ppu.WriteRegister(address & 7, value);
+            return;
+        }
         if (address == 0x4014) { OamDma(value); return; }
         if (address == 0x4016)
         {

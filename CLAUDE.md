@@ -152,9 +152,16 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   CPU cycle, emits a float sample stream via `NesMachine.CopyAudio`; the DMC reads sample bytes via a
   memory-reader callback and reports its **DMA CPU-stall cycles** (~4/fetch) via `Apu.TakeDmcStall()`,
   which the machine adds to the master cycle count so the CPU falls behind as on hardware),
-  `Mapper` (NROM 0, MMC1 1, UxROM 2, CNROM 3, MMC3 4, AxROM 7, MMC2 9, MMC4 10, Color Dreams 11,
-  Konami VRC2/VRC4 21·22·23·25 and VRC6 24·26, GxROM 66, Sunsoft FME-7 69; unknown mappers throw
-  `NotSupportedException`). Two IRQ hooks on `IMapper` (both default no-op, both drive
+  `Mapper` (NROM 0, MMC1 1, UxROM 2, CNROM 3, MMC3 4, **MMC5 5** (partial), AxROM 7, MMC2 9, MMC4 10,
+  Color Dreams 11, **Namco 163 19**, Konami VRC2/VRC4 21·22·23·25 and VRC6 24·26, GxROM 66,
+  Sunsoft FME-7 69, **VRC7 85**; unknown mappers throw `NotSupportedException`). MMC5 is a partial
+  implementation: PRG (4 modes, ROM/RAM select) + CHR (4 modes, with the separate sprite/background
+  register sets used in 8×16 mode) + the $5205/$5206 multiplier + scanline-compare IRQ; ExRAM-as-
+  nametable/fill/vertical-split and the MMC5 sound channels are **not** modeled. The 8×16 CHR split
+  needs two small `IMapper` hooks — `ChrReadSprite` (the PPU's sprite fetch calls it; defaults to
+  `ChrRead`) and `OnPpuCtrl` (the bus forwards `$2000` writes so MMC5 tracks 8×16 mode). VRC7 reuses
+  the shared `VrcIrq`; its FM audio and Namco 163's wavetable audio are accepted but not synthesized.
+  Two IRQ hooks on `IMapper` (both default no-op, both drive
   `IMapper.IrqPending` → `Mos6502.IrqLine`): MMC3's scanline IRQ via `OnScanline()` (clocked per
   rendered scanline), and the CPU-cycle down-counter IRQs of FME-7 (16-bit) and Konami VRC4/VRC6
   (8-bit + 341-dot prescaler, shared `VrcIrq` helper) via `OnCpuCycles(int)` (clocked in the CPU step
@@ -187,7 +194,7 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   catch-up renderer: a row splits bg→backdrop mid-line, which a per-scanline renderer can't produce),
   and other hand-assembled ROMs (scratchpad harness).
   It is mid-scanline-accurate with the full APU, full illegal-opcode set, DMC DMA stalls, and the
-  common mappers (0/1/2/3/4/7/9/10/11/21-26/66/69 — well past 90% of the licensed library). The
+  common mappers (0/1/2/3/4/5/7/9/10/11/19/21-26/66/69/85 — well past 90% of the licensed library). The
   remaining gap versus Mesen: because the CPU executes whole instructions atomically (not
   cycle-stepped), a register write takes effect at **instruction granularity** — within a few CPU
   cycles / a handful of dots of its true store cycle — so a raster split lands on the right scanline

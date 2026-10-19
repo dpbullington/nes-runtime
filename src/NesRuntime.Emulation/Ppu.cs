@@ -271,7 +271,7 @@ public sealed class Ppu
                 chr = _spritePatternBase + tile * 16 + row;
             }
 
-            byte lo = _mapper.ChrRead((ushort)chr), hi = _mapper.ChrRead((ushort)(chr + 8));
+            byte lo = _mapper.ChrReadSprite((ushort)chr), hi = _mapper.ChrReadSprite((ushort)(chr + 8));
             if ((attr & 0x40) != 0) { lo = Reverse(lo); hi = Reverse(hi); } // flipH
 
             _sprX[_sprCount] = _oam[i * 4 + 3];

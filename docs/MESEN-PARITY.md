@@ -83,7 +83,10 @@ audio filters/equalizer; per-game config & input remapping.
       deterministic-replay tests.
 - [ ] **PAL + Dendy** region support with auto-detect (parameterize the hardcoded NTSC timing in
       `Ppu`/`NesMachine`/`Apu`).
-- [ ] **Mapper batch:** MMC5 (5), Namco 163 (19), VRC7 (85), + common unlicensed/multicart mappers.
+- [~] **Mapper batch:** ✅ VRC7 (85) and Namco 163 (19) banking + IRQ; MMC5 (5) partial (PRG/CHR
+      banking incl. the 8×16 sprite/bg CHR split, multiplier, scanline IRQ). Remaining: MMC5
+      ExRAM-nametable/fill/split + audio, VRC7 FM audio, N163 wavetable audio, and unlicensed/multicart
+      mappers. Verified by register/banking/IRQ unit tests (rendering unverified without ROMs).
 - [~] **Expansion audio:** ✅ VRC6 (2 pulse + sawtooth) and FME-7 Sunsoft 5B (3 YM2149 square channels,
       4-bit log volume) synthesized and mixed into the APU via `IMapper.AudioSample()`. Remaining: 5B
       noise + hardware envelope, and the other expansion chips — VRC7 FM, Namco 163, MMC5.
