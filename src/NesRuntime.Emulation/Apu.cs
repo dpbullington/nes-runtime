@@ -45,13 +45,15 @@ public sealed class Apu
     private readonly float[] _buffer;
     private int _count;
     private float _hpPrevIn, _hpPrevOut;
+    private readonly Func<float>? _expansionSample;
 
     /// <summary>Creates the APU. <paramref name="readMemory"/> reads CPU-space bytes for the DMC's sample DMA.</summary>
-    public Apu(int sampleRate, Func<ushort, byte> readMemory)
+    public Apu(int sampleRate, Func<ushort, byte> readMemory, Func<float>? expansionSample = null)
     {
         _cyclesPerSample = CpuHz / sampleRate;
         _buffer = new float[sampleRate]; // up to 1 second
         _dmc = new Dmc(readMemory);
+        _expansionSample = expansionSample; // cartridge sound (VRC6, Sunsoft 5B), mixed into Mix()
     }
 
     /// <summary>The frame-counter IRQ or the DMC IRQ is asserted.</summary>
@@ -65,6 +67,22 @@ public sealed class Apu
 
     /// <summary>Resets the per-frame sample buffer. Call at the start of each frame.</summary>
     public void BeginFrame() => _count = 0;
+
+    /// <summary>Saves/restores APU state (channels + frame sequencer + high-pass). The per-frame sample
+    /// buffer is transient and intentionally omitted — it is rebuilt by the next frame.</summary>
+    internal void SerializeState(StateSerializer s)
+    {
+        _pulse1.SerializeState(s);
+        _pulse2.SerializeState(s);
+        _triangle.SerializeState(s);
+        _noise.SerializeState(s);
+        _dmc.SerializeState(s);
+        s.Transfer(ref _cycle);
+        s.Transfer(ref _frameCycle);
+        s.Transfer(ref _mode5); s.Transfer(ref _irqInhibit); s.Transfer(ref _frameIrq);
+        s.Transfer(ref _sampleAccum);
+        s.Transfer(ref _hpPrevIn); s.Transfer(ref _hpPrevOut);
+    }
 
     /// <summary>Samples generated so far this frame.</summary>
     public int SampleCount => _count;
@@ -165,7 +183,8 @@ public sealed class Apu
         double pulse = (p1 + p2) == 0 ? 0 : 95.88 / (8128.0 / (p1 + p2) + 100);
         double tnd = (t == 0 && n == 0 && d == 0) ? 0
             : 159.79 / (1.0 / (t / 8227.0 + n / 12241.0 + d / 22638.0) + 100);
-        return (float)(pulse + tnd);
+        float expansion = _expansionSample?.Invoke() ?? 0f; // cartridge sound chip (0 if none)
+        return (float)(pulse + tnd) + expansion;
     }
 
     public void WriteRegister(ushort address, byte value)
@@ -236,6 +255,16 @@ public sealed class Apu
         public bool LengthNonZero => _length > 0;
         public void SetEnabled(bool on) { _enabled = on; if (!on) _length = 0; }
 
+        public void SerializeState(StateSerializer s)
+        {
+            s.Transfer(ref _duty); s.Transfer(ref _dutyPos); s.Transfer(ref _timer); s.Transfer(ref _timerReload);
+            s.Transfer(ref _length); s.Transfer(ref _volume);
+            s.Transfer(ref _halt); s.Transfer(ref _constVol); s.Transfer(ref _enabled);
+            s.Transfer(ref _sweepEnabled); s.Transfer(ref _sweepNegate); s.Transfer(ref _sweepReload);
+            s.Transfer(ref _sweepPeriod); s.Transfer(ref _sweepShift); s.Transfer(ref _sweepDivider);
+            s.Transfer(ref _envStart); s.Transfer(ref _envDivider); s.Transfer(ref _envDecay);
+        }
+
         public void Write0(byte v) { _duty = v >> 6; _halt = (v & 0x20) != 0; _constVol = (v & 0x10) != 0; _volume = v & 0x0F; }
         public void Write1(byte v) { _sweepEnabled = (v & 0x80) != 0; _sweepPeriod = (v >> 4) & 7; _sweepNegate = (v & 8) != 0; _sweepShift = v & 7; _sweepReload = true; }
         public void Write2(byte v) { _timerReload = (_timerReload & 0x700) | v; }
@@ -291,6 +320,13 @@ public sealed class Apu
         public bool LengthNonZero => _length > 0;
         public void SetEnabled(bool on) { _enabled = on; if (!on) _length = 0; }
 
+        public void SerializeState(StateSerializer s)
+        {
+            s.Transfer(ref _timer); s.Transfer(ref _timerReload); s.Transfer(ref _seqPos);
+            s.Transfer(ref _length); s.Transfer(ref _linearReload); s.Transfer(ref _linear);
+            s.Transfer(ref _control); s.Transfer(ref _reloadFlag); s.Transfer(ref _enabled);
+        }
+
         public void Write0(byte v) { _control = (v & 0x80) != 0; _linearReload = v & 0x7F; }
         public void Write2(byte v) { _timerReload = (_timerReload & 0x700) | v; }
         public void Write3(byte v) { _timerReload = (_timerReload & 0xFF) | ((v & 7) << 8); if (_enabled) _length = LengthTable[v >> 3]; _reloadFlag = true; }
@@ -322,6 +358,14 @@ public sealed class Apu
         private int _shift = 1, _timer, _timerReload, _length, _volume;
         private bool _mode, _halt, _constVol, _enabled, _envStart;
         private int _envDivider, _envDecay;
+
+        public void SerializeState(StateSerializer s)
+        {
+            s.Transfer(ref _shift); s.Transfer(ref _timer); s.Transfer(ref _timerReload);
+            s.Transfer(ref _length); s.Transfer(ref _volume);
+            s.Transfer(ref _mode); s.Transfer(ref _halt); s.Transfer(ref _constVol); s.Transfer(ref _enabled); s.Transfer(ref _envStart);
+            s.Transfer(ref _envDivider); s.Transfer(ref _envDecay);
+        }
 
         public bool LengthNonZero => _length > 0;
         public void SetEnabled(bool on) { _enabled = on; if (!on) _length = 0; }
@@ -379,6 +423,18 @@ public sealed class Apu
         public int Stall; // CPU cycles the pending sample DMA stole (consumed by the machine)
         public bool Active => _bytesRemaining > 0;
         public int Output() => _output; // 0-127
+
+        public void SerializeState(StateSerializer s)
+        {
+            s.Transfer(ref _irqEnabled); s.Transfer(ref _loop);
+            s.Transfer(ref _rate); s.Transfer(ref _timer); s.Transfer(ref _output);
+            s.Transfer(ref _sampleAddr); s.Transfer(ref _curAddr);
+            s.Transfer(ref _sampleLen); s.Transfer(ref _bytesRemaining);
+            s.Transfer(ref _shift); s.Transfer(ref _bitsRemaining);
+            s.Transfer(ref _bufferEmpty); s.Transfer(ref _silence);
+            s.Transfer(ref _sampleBuffer);
+            s.Transfer(ref IrqPending); s.Transfer(ref Stall);
+        }
 
         public void Write0(byte v)
         {

@@ -20,11 +20,18 @@ public interface IMapper
     bool HasBattery => false;
     Span<byte> BatteryRam => Span<byte>.Empty;
 
+    /// <summary>Saves/restores mapper state (bank registers, PRG-RAM, CHR-RAM, IRQ) for save states.</summary>
+    void SerializeState(StateSerializer s);
+
     // IRQ hooks. MMC3-style mappers count rendered scanlines (OnScanline); Sunsoft FME-7-style
     // mappers count CPU cycles (OnCpuCycles). Both drive IrqPending; unused ones get no-op defaults.
     bool IrqPending => false;
     void OnScanline() { }
     void OnCpuCycles(int cycles) { }
+
+    /// <summary>Current expansion-audio output to mix into the APU (0 for mappers without a sound chip).
+    /// The chip's timers are advanced from <see cref="OnCpuCycles"/>.</summary>
+    float AudioSample() => 0f;
 
     static IMapper Create(INesRom rom) => rom.MapperNumber switch
     {
@@ -72,6 +79,7 @@ public sealed class NromMapper : IMapper
 
     public int Number => 0;
     public Mirroring Mirroring { get; }
+    public void SerializeState(StateSerializer s) { s.TransferBytes(_prgRam); if (_chrRam) s.TransferBytes(_chr); }
     public bool HasBattery { get; }
     public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
@@ -117,6 +125,7 @@ public sealed class UxRomMapper : IMapper
 
     public int Number => 2;
     public Mirroring Mirroring { get; }
+    public void SerializeState(StateSerializer s) { s.Transfer(ref _bank); s.TransferBytes(_chr); }
 
     public byte CpuRead(ushort address)
     {
@@ -157,6 +166,7 @@ public sealed class CnRomMapper : IMapper
 
     public int Number => 3;
     public Mirroring Mirroring { get; }
+    public void SerializeState(StateSerializer s) => s.Transfer(ref _chrBank);
 
     public byte CpuRead(ushort address) => address >= 0x8000 ? _prg[address & _prgMask] : (byte)0;
 
@@ -190,6 +200,12 @@ public sealed class AxRomMapper : IMapper
 
     public int Number => 7;
     public Mirroring Mirroring { get; private set; }
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(ref _bank);
+        Mirroring m = Mirroring; s.Transfer(ref m); Mirroring = m;
+        s.TransferBytes(_chr);
+    }
 
     public byte CpuRead(ushort address) => address >= 0x8000 ? _prg[_bank * 0x8000 + (address - 0x8000)] : (byte)0;
 
@@ -233,6 +249,13 @@ public sealed class Mmc1Mapper : IMapper
     }
 
     public int Number => 1;
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(ref _shift); s.Transfer(ref _count); s.Transfer(ref _control);
+        s.Transfer(ref _chrBank0); s.Transfer(ref _chrBank1); s.Transfer(ref _prgBank);
+        s.TransferBytes(_prgRam);
+        if (_chrRam) s.TransferBytes(_chr);
+    }
     public bool HasBattery { get; }
     public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
@@ -344,6 +367,16 @@ public sealed class Mmc3Mapper : IMapper
     public int Number => 4;
     public Mirroring Mirroring => _mirroring;
     public bool IrqPending => _irqPending;
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(_bank);
+        s.Transfer(ref _select);
+        s.Transfer(ref _mirroring);
+        s.Transfer(ref _irqLatch); s.Transfer(ref _irqCounter);
+        s.Transfer(ref _irqReload); s.Transfer(ref _irqEnabled); s.Transfer(ref _irqPending);
+        s.TransferBytes(_prgRam);
+        if (_chrRam) s.TransferBytes(_chr);
+    }
     public bool HasBattery { get; }
     public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
@@ -433,6 +466,7 @@ public sealed class GxRomMapper : IMapper
 
     public int Number => 66;
     public Mirroring Mirroring { get; }
+    public void SerializeState(StateSerializer s) { s.Transfer(ref _prgBank); s.Transfer(ref _chrBank); }
 
     public byte CpuRead(ushort address) =>
         address >= 0x8000 ? _prg[(_prgBank % _prgBanks32k) * 0x8000 + (address - 0x8000)] : (byte)0;
@@ -471,6 +505,7 @@ public sealed class ColorDreamsMapper : IMapper
 
     public int Number => 11;
     public Mirroring Mirroring { get; }
+    public void SerializeState(StateSerializer s) { s.Transfer(ref _prgBank); s.Transfer(ref _chrBank); }
 
     public byte CpuRead(ushort address) =>
         address >= 0x8000 ? _prg[(_prgBank % _prgBanks32k) * 0x8000 + (address - 0x8000)] : (byte)0;
@@ -502,6 +537,7 @@ public sealed class Fme7Mapper : IMapper
     private readonly int _chrBanks1k;
     private readonly int[] _chrBank = new int[8];
     private readonly int[] _prgBank = new int[4]; // slots: $6000, $8000, $A000, $C000
+    private readonly Sunsoft5BAudio _audio = new();
 
     private int _command;
     private bool _prgRamSelected, _prgRamEnabled;
@@ -525,6 +561,17 @@ public sealed class Fme7Mapper : IMapper
     public int Number => 69;
     public Mirroring Mirroring => _mirroring;
     public bool IrqPending => _irqPending;
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(_chrBank); s.Transfer(_prgBank);
+        s.Transfer(ref _command);
+        s.Transfer(ref _prgRamSelected); s.Transfer(ref _prgRamEnabled);
+        s.Transfer(ref _mirroring);
+        s.Transfer(ref _irqCounter);
+        s.Transfer(ref _irqCountEnabled); s.Transfer(ref _irqEnabled); s.Transfer(ref _irqPending);
+        s.TransferBytes(_prgRam);
+        if (_chrRam) s.TransferBytes(_chr);
+    }
     public bool HasBattery { get; }
     public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
@@ -555,7 +602,8 @@ public sealed class Fme7Mapper : IMapper
         {
             case 0x8000: _command = value & 0x0F; break;
             case 0xA000: WriteParameter(value); break;
-            // $C000/$E000 select/write the 5B audio registers — accepted, not synthesized.
+            case 0xC000: _audio.WriteAddress(value); break; // 5B PSG address latch
+            case 0xE000: _audio.WriteData(value); break;    // 5B PSG data
         }
     }
 
@@ -596,6 +644,8 @@ public sealed class Fme7Mapper : IMapper
 
     public void OnCpuCycles(int cycles)
     {
+        _audio.Clock(cycles); // the 5B PSG runs regardless of the IRQ counter
+
         if (!_irqCountEnabled) return;
         for (int i = 0; i < cycles; i++)
         {
@@ -603,6 +653,8 @@ public sealed class Fme7Mapper : IMapper
             else _irqCounter = (_irqCounter - 1) & 0xFFFF;
         }
     }
+
+    public float AudioSample() => _audio.Output();
 
     public byte ChrRead(ushort address) => _chr[ChrOffset(address)];
     public void ChrWrite(ushort address, byte value) { if (_chrRam) _chr[ChrOffset(address)] = value; }
@@ -642,6 +694,13 @@ public sealed class Mmc2Mapper : IMapper
 
     public int Number => 9;
     public Mirroring Mirroring => _mirroring;
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(ref _prgBank);
+        s.Transfer(ref _chrFD0); s.Transfer(ref _chrFE0); s.Transfer(ref _chrFD1); s.Transfer(ref _chrFE1);
+        s.Transfer(ref _latch0FE); s.Transfer(ref _latch1FE);
+        s.Transfer(ref _mirroring);
+    }
 
     public byte CpuRead(ushort address)
     {
@@ -727,6 +786,14 @@ public sealed class Mmc4Mapper : IMapper
 
     public int Number => 10;
     public Mirroring Mirroring => _mirroring;
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(ref _prgBank);
+        s.Transfer(ref _chrFD0); s.Transfer(ref _chrFE0); s.Transfer(ref _chrFD1); s.Transfer(ref _chrFE1);
+        s.Transfer(ref _latch0FE); s.Transfer(ref _latch1FE);
+        s.Transfer(ref _mirroring);
+        s.TransferBytes(_prgRam);
+    }
     public bool HasBattery { get; }
     public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
@@ -796,6 +863,13 @@ internal sealed class VrcIrq
 
     public bool Pending { get; private set; }
 
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(ref _latch); s.Transfer(ref _counter); s.Transfer(ref _prescaler);
+        s.Transfer(ref _enabled); s.Transfer(ref _enableAfterAck); s.Transfer(ref _cycleMode);
+        bool p = Pending; s.Transfer(ref p); Pending = p;
+    }
+
     public void WriteLatch8(byte v) => _latch = v;                                  // VRC6: one write
     public void WriteLatchLow(byte v) => _latch = (byte)((_latch & 0xF0) | (v & 0x0F));  // VRC4: nibble pair
     public void WriteLatchHigh(byte v) => _latch = (byte)((_latch & 0x0F) | ((v & 0x0F) << 4));
@@ -850,6 +924,7 @@ public sealed class Vrc6Mapper : IMapper
     private readonly int _number;
     private readonly int[] _chrReg = new int[8];
     private readonly VrcIrq _irq = new();
+    private readonly Vrc6Audio _audio = new();
 
     private int _prg16, _prg8;
     private Mirroring _mirroring;
@@ -870,6 +945,15 @@ public sealed class Vrc6Mapper : IMapper
     public int Number => _number;
     public Mirroring Mirroring => _mirroring;
     public bool IrqPending => _irq.Pending;
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(_chrReg);
+        s.Transfer(ref _prg16); s.Transfer(ref _prg8);
+        s.Transfer(ref _mirroring);
+        _irq.SerializeState(s);
+        s.TransferBytes(_prgRam);
+        if (_chrRam) s.TransferBytes(_chr);
+    }
     public bool HasBattery { get; }
     public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
@@ -896,7 +980,9 @@ public sealed class Vrc6Mapper : IMapper
         switch (address & 0xF000)
         {
             case 0x8000: _prg16 = value & 0x0F; break;
-            case 0xB000: if (sub == 3) _mirroring = MirrorOf(value); break;
+            case 0x9000: if (sub < 3) _audio.WritePulse(0, sub, value); else _audio.WriteFreqCtrl(value); break;
+            case 0xA000: if (sub < 3) _audio.WritePulse(1, sub, value); break;
+            case 0xB000: if (sub == 3) _mirroring = MirrorOf(value); else _audio.WriteSaw(sub, value); break;
             case 0xC000: _prg8 = value & 0x1F; break;
             case 0xD000: _chrReg[sub] = value; break;      // R0-R3
             case 0xE000: _chrReg[4 + sub] = value; break;  // R4-R7
@@ -908,11 +994,11 @@ public sealed class Vrc6Mapper : IMapper
                     case 2: _irq.Acknowledge(); break;
                 }
                 break;
-            // $9000/$A000: expansion-audio registers — accepted, not synthesized.
         }
     }
 
-    public void OnCpuCycles(int cycles) => _irq.Clock(cycles);
+    public void OnCpuCycles(int cycles) { _irq.Clock(cycles); _audio.Clock(cycles); }
+    public float AudioSample() => _audio.Output();
 
     public byte ChrRead(ushort address) => _chr[ChrOffset(address)];
     public void ChrWrite(ushort address, byte value) { if (_chrRam) _chr[ChrOffset(address)] = value; }
@@ -974,6 +1060,15 @@ public sealed class Vrc24Mapper : IMapper
     public int Number => _number;
     public Mirroring Mirroring => _mirroring;
     public bool IrqPending => _isVrc4 && _irq.Pending;
+    public void SerializeState(StateSerializer s)
+    {
+        s.Transfer(_chrLow); s.Transfer(_chrHigh);
+        s.Transfer(ref _prgLow); s.Transfer(ref _prgHigh); s.Transfer(ref _swapMode);
+        s.Transfer(ref _mirroring);
+        _irq.SerializeState(s);
+        s.TransferBytes(_prgRam);
+        if (_chrRam) s.TransferBytes(_chr);
+    }
     public bool HasBattery { get; }
     public Span<byte> BatteryRam => HasBattery ? _prgRam : default;
 
@@ -1054,4 +1149,152 @@ public sealed class Vrc24Mapper : IMapper
         2 => Mirroring.SingleScreenLower,
         _ => Mirroring.SingleScreenUpper,
     };
+}
+
+/// <summary>
+/// VRC6 expansion sound: two pulse channels (4-bit volume, 3-bit duty, 12-bit period) plus a
+/// sawtooth (6-bit accumulator rate, 12-bit period). Timers run at the CPU clock; the mix is a modest
+/// blend level added to the APU. Frequency-shift modes (×16/×256) and the halt bit are honored.
+/// </summary>
+internal sealed class Vrc6Audio
+{
+    private readonly int[] _volDuty = new int[2];   // $x000: bit7 mode, 6-4 duty, 3-0 volume
+    private readonly int[] _period = new int[2];    // 12-bit
+    private readonly bool[] _enabled = new bool[2];
+    private readonly int[] _timer = new int[2];
+    private readonly int[] _step = new int[2];      // 0-15 duty step
+
+    private int _sawRate;      // 6-bit
+    private int _sawPeriod;    // 12-bit
+    private bool _sawEnabled;
+    private int _sawTimer, _sawAccum, _sawStep;     // accum 8-bit, step 0-13
+
+    private bool _halt;
+    private int _freqShift;    // 0, 4 (×16), or 8 (×256) applied as period >> shift
+
+    public void WritePulse(int ch, int reg, byte v)
+    {
+        switch (reg)
+        {
+            case 0: _volDuty[ch] = v; break;
+            case 1: _period[ch] = (_period[ch] & 0xF00) | v; break;
+            case 2:
+                _period[ch] = (_period[ch] & 0x0FF) | ((v & 0x0F) << 8);
+                _enabled[ch] = (v & 0x80) != 0;
+                if (!_enabled[ch]) _step[ch] = 0;
+                break;
+        }
+    }
+
+    public void WriteSaw(int reg, byte v)
+    {
+        switch (reg)
+        {
+            case 0: _sawRate = v & 0x3F; break;
+            case 1: _sawPeriod = (_sawPeriod & 0xF00) | v; break;
+            case 2:
+                _sawPeriod = (_sawPeriod & 0x0FF) | ((v & 0x0F) << 8);
+                _sawEnabled = (v & 0x80) != 0;
+                if (!_sawEnabled) { _sawAccum = 0; _sawStep = 0; }
+                break;
+        }
+    }
+
+    public void WriteFreqCtrl(byte v) // $9003
+    {
+        _halt = (v & 1) != 0;
+        _freqShift = (v & 0x04) != 0 ? 8 : (v & 0x02) != 0 ? 4 : 0;
+    }
+
+    public void Clock(int cpuCycles)
+    {
+        if (_halt) return;
+        for (int i = 0; i < cpuCycles; i++)
+        {
+            for (int ch = 0; ch < 2; ch++)
+            {
+                if (!_enabled[ch]) continue;
+                if (--_timer[ch] <= 0) { _timer[ch] = (_period[ch] >> _freqShift) + 1; _step[ch] = (_step[ch] + 1) & 15; }
+            }
+            if (_sawEnabled && --_sawTimer <= 0)
+            {
+                _sawTimer = (_sawPeriod >> _freqShift) + 1;
+                if ((_sawStep & 1) == 0) _sawAccum = (_sawAccum + _sawRate) & 0xFF; // add on even steps (7 adds)
+                if (++_sawStep >= 14) { _sawStep = 0; _sawAccum = 0; }
+            }
+        }
+    }
+
+    public float Output()
+    {
+        int sum = 0;
+        for (int ch = 0; ch < 2; ch++)
+        {
+            if (!_enabled[ch]) continue;
+            int vd = _volDuty[ch];
+            if ((vd & 0x80) != 0 || _step[ch] <= ((vd >> 4) & 7)) sum += vd & 0x0F; // 0..15
+        }
+        if (_sawEnabled) sum += (_sawAccum >> 3) & 0x1F;                            // 0..31
+        return sum * (0.5f / 61f); // max 15+15+31=61, scaled to blend with the APU
+    }
+}
+
+/// <summary>
+/// Sunsoft 5B (FME-7) expansion sound: the YM2149 PSG's three square-wave tone channels with 4-bit
+/// logarithmic volume and per-channel tone enable. Register access is the AY address/data latch pair.
+/// Noise and the hardware envelope are not modeled (tones + volume cover most music).
+/// </summary>
+internal sealed class Sunsoft5BAudio
+{
+    private static readonly float[] VolTable =
+    {
+        0f, 0.0137f, 0.0205f, 0.0291f, 0.0423f, 0.0618f, 0.0847f, 0.1369f,
+        0.1691f, 0.2647f, 0.3527f, 0.4499f, 0.5704f, 0.6873f, 0.8482f, 1.0f,
+    };
+
+    private readonly int[] _period = new int[3];
+    private readonly int[] _vol = new int[3];
+    private readonly int[] _counter = new int[3];
+    private readonly bool[] _phase = new bool[3];
+    private readonly bool[] _toneDisabled = new bool[3];
+    private int _latch, _prescaler;
+
+    public void WriteAddress(byte v) => _latch = v & 0x0F;
+
+    public void WriteData(byte v)
+    {
+        switch (_latch)
+        {
+            case 0: _period[0] = (_period[0] & 0xF00) | v; break;
+            case 1: _period[0] = (_period[0] & 0x0FF) | ((v & 0x0F) << 8); break;
+            case 2: _period[1] = (_period[1] & 0xF00) | v; break;
+            case 3: _period[1] = (_period[1] & 0x0FF) | ((v & 0x0F) << 8); break;
+            case 4: _period[2] = (_period[2] & 0xF00) | v; break;
+            case 5: _period[2] = (_period[2] & 0x0FF) | ((v & 0x0F) << 8); break;
+            case 7: _toneDisabled[0] = (v & 1) != 0; _toneDisabled[1] = (v & 2) != 0; _toneDisabled[2] = (v & 4) != 0; break;
+            case 8: _vol[0] = v & 0x0F; break;  // bit4 (use envelope) ignored
+            case 9: _vol[1] = v & 0x0F; break;
+            case 10: _vol[2] = v & 0x0F; break;
+            // 6 (noise period), 11-13 (envelope) not modeled
+        }
+    }
+
+    public void Clock(int cpuCycles)
+    {
+        for (int i = 0; i < cpuCycles; i++)
+        {
+            if (++_prescaler < 16) continue; // YM2149 divides the master clock by 16
+            _prescaler = 0;
+            for (int ch = 0; ch < 3; ch++)
+                if (--_counter[ch] <= 0) { _counter[ch] = Math.Max(1, _period[ch]); _phase[ch] = !_phase[ch]; }
+        }
+    }
+
+    public float Output()
+    {
+        float sum = 0;
+        for (int ch = 0; ch < 3; ch++)
+            if (_toneDisabled[ch] || _phase[ch]) sum += VolTable[_vol[ch]]; // tone-disable forces the level through
+        return sum * (0.4f / 3f);
+    }
 }

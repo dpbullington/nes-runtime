@@ -38,6 +38,8 @@ public sealed class Ppu
     private bool _renderBg, _renderSprites, _renderBgLeft, _renderSpritesLeft, _rendering;
     private bool _sprite16, _nmiEnabled;
     private int _bgPatternBase, _spritePatternBase, _vramInc = 1;
+    private int _grayscaleMask = 0x3F;  // $2001 bit 0: 0x30 masks output to the gray column when on
+    private int _emphasis;              // $2001 bits 5-7 as R|G|B in bits 0-2 (NTSC)
 
     // Time position and per-line lazy-render state.
     private int _scanline, _dot;      // dot clock (scanline 0-261, dot 0-340)
@@ -62,6 +64,32 @@ public sealed class Ppu
 
     /// <summary>True when background or sprite rendering is on.</summary>
     public bool RenderingEnabled => _rendering;
+
+    /// <summary>PPUMASK color-emphasis bits as R|G|B in bits 0-2 (NTSC); the host tints the frame with these.</summary>
+    public int EmphasisBits => _emphasis;
+
+    /// <summary>
+    /// Saves/restores persistent PPU state for save states. Transient per-frame render position and the
+    /// sprite-evaluation scratch are intentionally omitted — <see cref="BeginFrame"/> re-initializes
+    /// them at the start of every frame, and save states are taken at frame boundaries.
+    /// </summary>
+    internal void SerializeState(StateSerializer s)
+    {
+        s.TransferBytes(_vram);
+        s.TransferBytes(_palette);
+        s.TransferBytes(_oam);
+        s.Transfer(ref _oamAddr); s.Transfer(ref _readBuffer); s.Transfer(ref _lastWrite);
+        s.Transfer(ref _v); s.Transfer(ref _t); s.Transfer(ref _x); s.Transfer(ref _w);
+        s.Transfer(ref _renderBg); s.Transfer(ref _renderSprites); s.Transfer(ref _renderBgLeft);
+        s.Transfer(ref _renderSpritesLeft); s.Transfer(ref _rendering);
+        s.Transfer(ref _sprite16); s.Transfer(ref _nmiEnabled);
+        s.Transfer(ref _bgPatternBase); s.Transfer(ref _spritePatternBase); s.Transfer(ref _vramInc);
+        s.Transfer(ref _grayscaleMask); s.Transfer(ref _emphasis);
+        bool vb = VBlank; s.Transfer(ref vb); VBlank = vb;
+        bool s0 = Sprite0Hit; s.Transfer(ref s0); Sprite0Hit = s0;
+        bool so = SpriteOverflow; s.Transfer(ref so); SpriteOverflow = so;
+        s.Transfer(ref _nmiLatch); s.Transfer(ref _nmiPrev);
+    }
 
     // --- Machine-facing frame driver ---
 
@@ -321,6 +349,8 @@ public sealed class Ppu
                 _renderBgLeft = (value & 0x02) != 0;
                 _renderSpritesLeft = (value & 0x04) != 0;
                 _rendering = _renderBg || _renderSprites;
+                _grayscaleMask = (value & 0x01) != 0 ? 0x30 : 0x3F;
+                _emphasis = (value >> 5) & 7;
                 break;
             case 3: _oamAddr = value; break;
             case 4: _oam[_oamAddr++] = value; break;
@@ -410,5 +440,5 @@ public sealed class Ppu
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private byte Palette(int i) => (byte)(_palette[PaletteIndex((ushort)(0x3F00 + i))] & 0x3F);
+    private byte Palette(int i) => (byte)(_palette[PaletteIndex((ushort)(0x3F00 + i))] & _grayscaleMask);
 }

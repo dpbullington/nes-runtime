@@ -49,7 +49,11 @@ public sealed class DispatcherFrameClock : IFrameClock
         _displayLink = CADisplayLink.Create(OnDisplayLink);
         // Cap to the console rate; on a 60 Hz panel this is already the natural vsync cadence, and on
         // a 120 Hz ProMotion panel it fires every other refresh instead of running the game double speed.
+        // PreferredFramesPerSecond is obsoleted on Mac Catalyst 15+ in favor of PreferredFrameRateRange,
+        // but still works and is simpler; suppress the platform-compat analyzer for this one call.
+#pragma warning disable CA1422
         _displayLink.PreferredFramesPerSecond = (int)Math.Round(TargetFps);
+#pragma warning restore CA1422
         _displayLink.AddToRunLoop(NSRunLoop.Main, NSRunLoopMode.Common);
 #else
         if (_timer is not null)

@@ -28,12 +28,15 @@ public sealed class NesMachine : IBus
     {
         _mapper = IMapper.Create(rom);
         _ppu = new Ppu(_mapper);
-        _apu = new Apu(sampleRate, Read); // Read supplies the DMC's sample DMA
+        _apu = new Apu(sampleRate, Read, () => _mapper.AudioSample()); // Read = DMC DMA; delegate = cartridge sound
         _cpu = new Mos6502(this);
         _cpu.Reset();
     }
 
     public Ppu Ppu => _ppu;
+
+    /// <summary>PPUMASK color-emphasis bits (R|G|B in bits 0-2) for the host to tint the frame.</summary>
+    public int Emphasis => _ppu.EmphasisBits;
 
     /// <summary>True when the cartridge has battery-backed PRG-RAM the host should persist.</summary>
     public bool HasBattery => _mapper.HasBattery;
@@ -47,6 +50,35 @@ public sealed class NesMachine : IBus
         Span<byte> ram = _mapper.BatteryRam;
         if (ram.IsEmpty || data.IsEmpty) return;
         data[..Math.Min(data.Length, ram.Length)].CopyTo(ram);
+    }
+
+    /// <summary>Serializes the complete machine state (CPU/PPU/APU/mapper/RAM/controllers) to a byte
+    /// array — a save state. Take it at a frame boundary (between <see cref="StepFrame"/> calls).</summary>
+    public byte[] SaveState() => StateSerializer.Save(Serialize);
+
+    /// <summary>Restores a state produced by <see cref="SaveState"/> for the <em>same</em> ROM/mapper.
+    /// Throws <see cref="InvalidOperationException"/> on a malformed or mismatched state.</summary>
+    public void LoadState(ReadOnlySpan<byte> data) => StateSerializer.Load(data, Serialize);
+
+    private const int StateMagic = 0x4E455353; // "NESS"
+    private const int StateVersion = 2; // v2 added PPU grayscale/emphasis
+
+    private void Serialize(StateSerializer s)
+    {
+        int magic = StateMagic, version = StateVersion, mapper = _mapper.Number;
+        s.Transfer(ref magic); s.Transfer(ref version); s.Transfer(ref mapper);
+        if (!s.IsWriting && (magic != StateMagic || version != StateVersion || mapper != _mapper.Number))
+            throw new InvalidOperationException(
+                $"Save state mismatch (magic={magic:X8}, version={version}, mapper={mapper}); expected mapper {_mapper.Number}.");
+
+        _cpu.SerializeState(s);
+        _ppu.SerializeState(s);
+        _apu.SerializeState(s);
+        _mapper.SerializeState(s);
+        s.TransferBytes(_ram);
+        s.Transfer(ref _btn1); s.Transfer(ref _btn2); s.Transfer(ref _shift1); s.Transfer(ref _shift2);
+        s.Transfer(ref _strobe);
+        s.Transfer(ref _cycles);
     }
 
     /// <summary>Copies this frame's synthesized audio into <paramref name="dest"/> (padded to fit).</summary>

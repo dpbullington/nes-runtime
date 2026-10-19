@@ -33,6 +33,12 @@ dotnet build -t:Run -c Release -f net10.0-maccatalyst hosts/NesRuntime.Maui/NesR
   workload is only installed for that band; a newer SDK (e.g. 10.0.400) fails the host build with
   `NETSDK1147: workloads must be installed`. If you upgrade the pin, run `dotnet workload restore`
   first so the Mac Catalyst workload is present for the new band.
+- **Clean-build the host for Release after code changes.** Mac Catalyst Release is AOT-compiled, and
+  *incremental* Release builds don't reliably re-AOT the native binary — the managed dll updates but
+  the AOT image doesn't, and the mismatch makes the app `SIGABRT` at startup in `load_aot_module`
+  (empty managed stacktrace, crash inside `mono_jit_init`/`xamarin_bridge_initialize`). Fix:
+  `rm -rf hosts/NesRuntime.Maui/bin hosts/NesRuntime.Maui/obj` then build `-c Release`. (Debug uses the
+  interpreter and isn't affected, but see the perf note — run gameplay in Release.)
 - The **MAUI workload is installed** in this environment. The host targets **desktop only** — Mac
   Catalyst on macOS, Windows on Windows (each conditioned by OS). So `dotnet build NesRuntime.slnx`
   and Rider's solution build succeed on either without the Android SDK or Xcode iOS simulators.
@@ -119,6 +125,14 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   `MainPage` shows on the status line (`🔋 …`) so a header-not-battery / path-denied case is visible
   rather than looking like "saves don't load". All file I/O is wrapped in try/catch so a
   missing/locked/corrupt save never crashes the game.
+  **Save states + rewind:** `EmulatorGame` manages **8 manual slots** at
+  `~/.nes-runtime/save/<rom>/state<N>.bin`. The host picks a slot (a `Picker` whose labels show each
+  slot's on-disk timestamp via `EmulatorGame.GetSlots()`) and the Save/Load/Delete buttons call the
+  static `SaveToSlot`/`LoadFromSlot`/`DeleteSlot` **directly** — safe because button handlers run
+  between frames on the single UI thread, so the machine is at a frame boundary. It also records a
+  per-frame `RewindBuffer` ring (~20 s of `NesMachine.SaveState()` snapshots + that frame's input);
+  holding the Rewind button (`RewindHeld` static) pops snapshots and re-renders them backward. All
+  outcomes show on the `🔋` status line.
 - **`src/NesRuntime.Emulation`** — a self-contained NES execution core that runs real ROMs, distinct
   from the C# authoring SDK: `Mos6502` (full official **and** unofficial/illegal 6502 opcode set —
   LAX/SAX/DCP/ISC/SLO/RLA/SRE/RRA/ANC/ALR/ARR/SBX/undocumented NOPs + unstable stores — plus a
@@ -147,12 +161,21 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   loop). `IrqLine` is refreshed after each clock and after every mapper write (so an `$E000` MMC3
   acknowledge, an FME-7 `$D`, or a VRC control/ack write clears it). MMC2/MMC4 flip their CHR banks
   via a **fetch latch** updated as a side effect of `ChrRead` (tile `$FD`/`$FE`), needing no PPU
-  change. FME-7's 5B and VRC6's expansion audio are accepted but not synthesized; VRC2/VRC4 register
-  select bits are decoded by OR-ing every candidate address line (robust to iNES-1.0 submapper
-  ambiguity).
+  change. **Expansion audio is synthesized:** VRC6 (two pulses + sawtooth) and FME-7's Sunsoft 5B
+  (three YM2149 square channels, 4-bit log volume) run their timers from `OnCpuCycles` and surface via
+  `IMapper.AudioSample()`, which the `Apu` mixes into `Mix()` through a delegate the machine wires up
+  (`() => _mapper.AudioSample()`). 5B noise + hardware envelope are not modeled (tones + volume cover
+  most music). VRC2/VRC4 register select bits are decoded by OR-ing every candidate address line
+  (robust to iNES-1.0 submapper ambiguity).
   Battery-backed cartridges expose their 8 KiB PRG-RAM for saving: `IMapper.HasBattery` (set from the
   iNES header) + `IMapper.BatteryRam` (a `Span` over the `$6000` RAM, empty otherwise) surface through
   `NesMachine.HasBattery`/`BatteryRam`/`LoadBattery` for the host to persist and restore.
+  **Save states:** every component (CPU/PPU/APU + its channels/every mapper/`VrcIrq`) implements
+  `SerializeState(StateSerializer)` — one bidirectional method that both writes and reads so the
+  directions can't drift — and `NesMachine.SaveState()`/`LoadState()` wrap it with a
+  magic/version/mapper-guarded header. Transient per-frame render state is intentionally omitted
+  because `Ppu.BeginFrame` reinitializes it each frame (states are frame-aligned); arrays are filled
+  in place so held references (VRAM, PRG-RAM) stay valid.
   `INesRom` (iNES/NES 2.0 loader), and `NesMachine` (bus + controllers + per-frame step). The PPU
   fetches all CHR through `IMapper.ChrRead` and reads `IMapper.Mirroring` live, and the bus routes
   PRG through the mapper — so adding a (non-IRQ) mapper is just a new `IMapper` class, no PPU changes.
@@ -169,9 +192,13 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   cycle-stepped), a register write takes effect at **instruction granularity** — within a few CPU
   cycles / a handful of dots of its true store cycle — so a raster split lands on the right scanline
   and within a few pixels horizontally, not at the exact dot. Also: the unstable stores (SHX/SHY/SHA/TAS/LAS) use the common
-  "AND high-byte+1" behavior rather than being bus-conflict/RDY accurate; VRC6/FME-7 expansion audio
-  is silent; VRC6 CHR banking mode 0 (eight 1 KiB banks) is the only mode modeled; and the PPUMASK
-  grayscale/color-emphasis bits ($2001 bits 0, 5-7) are not applied to the output palette index.
+  "AND high-byte+1" behavior rather than being bus-conflict/RDY accurate; VRC6/5B expansion audio is
+  synthesized but 5B noise+envelope are not; and VRC6 CHR banking mode 0 (eight 1 KiB banks) is the
+  only mode modeled. PPUMASK
+  grayscale ($2001 bit 0) is applied per-pixel in `Ppu.Palette` (masks the index to the gray column);
+  color emphasis (bits 5-7) is captured per frame (`NesMachine.Emphasis`) and applied host-side —
+  `EmulatorGame` reports it via `NesGame.ReportEmphasis` → `FrameBuffer.Emphasis` →
+  `MasterPalette.ToRgb`, so a mid-frame emphasis change tints the whole frame by its last value.
 
 ## Conventions that matter here
 

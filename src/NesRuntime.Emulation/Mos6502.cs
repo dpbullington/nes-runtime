@@ -50,6 +50,17 @@ public sealed class Mos6502
         Cycles = 0;
     }
 
+    /// <summary>Saves/restores the full CPU state for save states (see <see cref="StateSerializer"/>).</summary>
+    internal void SerializeState(StateSerializer s)
+    {
+        s.Transfer(ref A); s.Transfer(ref X); s.Transfer(ref Y); s.Transfer(ref S);
+        s.Transfer(ref PC);
+        s.Transfer(ref C); s.Transfer(ref Z); s.Transfer(ref I); s.Transfer(ref D); s.Transfer(ref V); s.Transfer(ref N);
+        s.Transfer(ref IrqLine);
+        long c = Cycles; s.Transfer(ref c); Cycles = c;
+        s.Transfer(ref _pendingCycles);
+    }
+
     /// <summary>Services a non-maskable interrupt (vblank NMI). Returns the cycles consumed.</summary>
     public int Nmi()
     {

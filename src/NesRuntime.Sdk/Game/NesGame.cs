@@ -65,7 +65,16 @@ public abstract class NesGame
     /// </summary>
     protected virtual bool RenderAudio(Span<float> buffer) => false;
 
+    /// <summary>
+    /// For framebuffer games (e.g. a ROM emulator): report this frame's PPUMASK color emphasis so the
+    /// host tints the resolved RGB. No-op for the normal SDK path.
+    /// </summary>
+    protected void ReportEmphasis(NesRuntime.Core.Ppu.ColorEmphasis emphasis) => FrameEmphasis = emphasis;
+
     // --- Runtime plumbing (called by the SDK's runtime core, not by game code). ---
+
+    /// <summary>The emphasis last reported via <see cref="ReportEmphasis"/> (default: none).</summary>
+    internal NesRuntime.Core.Ppu.ColorEmphasis FrameEmphasis { get; private set; }
 
     internal void Attach(IGraphicsDevice graphics, IAudioDevice audio, IInputManager input, ISaveManager save)
     {

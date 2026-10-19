@@ -29,6 +29,9 @@ public partial class MainPage : ContentPage
     private bool _showBattery;      // true while the ROM emulator (not the sample game) is running
     private IDispatcherTimer? _statusTimer;
 
+    private Picker? _slotPicker;    // save-state slot selector (labels show per-slot timestamps)
+    private int _activeSlot;
+
     // Actual (measured) frames-per-second, from the count of frames the view has presented.
     private readonly Stopwatch _fpsClock = Stopwatch.StartNew();
     private long _fpsLastFrame;
@@ -56,6 +59,20 @@ public partial class MainPage : ContentPage
         BatteryLabel.Text = _showBattery
             ? (EmulatorGame.BatteryStatus.Length > 0 ? $"🔋 {EmulatorGame.BatteryStatus}" : "🔋 battery: waiting…")
             : "🔋 battery: load a .nes cartridge to use saves";
+    }
+
+    // Rebuilds the slot-picker labels from each slot's on-disk timestamp, preserving the selection.
+    private void RefreshSlots()
+    {
+        if (_slotPicker is null)
+            return;
+
+        var items = new List<string>(EmulatorGame.SlotCount);
+        foreach (EmulatorGame.SlotInfo s in EmulatorGame.GetSlots())
+            items.Add(s.Exists ? $"Slot {s.Index + 1} • {s.Time:yyyy-MM-dd HH:mm}" : $"Slot {s.Index + 1} • empty");
+
+        _slotPicker.ItemsSource = items;
+        _slotPicker.SelectedIndex = Math.Clamp(_activeSlot, 0, items.Count - 1);
     }
 
     // Measures real throughput: frames presented since the last update divided by elapsed time.
@@ -164,6 +181,7 @@ public partial class MainPage : ContentPage
                 (v, a, i, c) => GameRunner.Create<EmulatorGame>(v, a, i, c, NesRuntime.Core.Region.Ntsc),
                 $"Running {file.FileName}");
             UpdateBatteryStatus(); // reflect the restore outcome immediately, not on the next tick
+            RefreshSlots();        // show this ROM's save-state slots + timestamps
         }
         catch (Exception ex)
         {
@@ -211,7 +229,35 @@ public partial class MainPage : ContentPage
             Children = { dpad, actions },
         };
 
-        return new VerticalStackLayout { Spacing = 12, Children = { topRow, pad } };
+        // Save-state slots + rewind (apply to the ROM emulator). The picker labels show per-slot
+        // timestamps; Save/Delete refresh them immediately.
+        _slotPicker = new Picker { Title = "Save slot", WidthRequest = 230, VerticalOptions = LayoutOptions.Center };
+        _slotPicker.SelectedIndexChanged += (_, _) => { if (_slotPicker.SelectedIndex >= 0) _activeSlot = _slotPicker.SelectedIndex; };
+
+        var saveStateButton = new Button { Text = "Save" };
+        saveStateButton.Clicked += (_, _) => { EmulatorGame.SaveToSlot(_activeSlot); RefreshSlots(); };
+
+        var loadStateButton = new Button { Text = "Load" };
+        loadStateButton.Clicked += (_, _) => EmulatorGame.LoadFromSlot(_activeSlot);
+
+        var deleteStateButton = new Button { Text = "Delete" };
+        deleteStateButton.Clicked += (_, _) => { EmulatorGame.DeleteSlot(_activeSlot); RefreshSlots(); };
+
+        var rewindButton = new Button { Text = "⏪ Rewind (hold)" };
+        rewindButton.Pressed += (_, _) => EmulatorGame.RewindHeld = true;
+        rewindButton.Released += (_, _) => EmulatorGame.RewindHeld = false;
+
+        var stateRow = new HorizontalStackLayout
+        {
+            Spacing = 10,
+            HorizontalOptions = LayoutOptions.Center,
+            Children = { _slotPicker, saveStateButton, loadStateButton, deleteStateButton, rewindButton },
+        };
+
+        RefreshSlots();
+        _slotPicker.SelectedIndex = 0;
+
+        return new VerticalStackLayout { Spacing = 12, Children = { topRow, stateRow, pad } };
     }
 
     private void AddHoldButton(Layout parent, string text, NesButtons button, int row = -1, int col = -1)

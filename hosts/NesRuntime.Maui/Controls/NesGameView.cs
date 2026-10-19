@@ -56,7 +56,7 @@ public sealed class NesGameView : SKCanvasView
         try
         {
             _palette ??= MasterPalette.Default;
-            frame.ResolveTo(_rgb, _palette);
+            frame.ResolveTo(_rgb, _palette, frame.Emphasis);
             BlitToBitmap();
 
             SKRect dest = FitPreservingAspect(e.Info.Width, e.Info.Height);

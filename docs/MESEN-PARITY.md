@@ -75,15 +75,23 @@ audio filters/equalizer; per-game config & input remapping.
 
 ### Tier A — high value, moderate effort → "excellent daily driver," ~98% compat
 
-- [ ] **Save states + rewind** — deterministic serialization of every component (CPU/PPU/APU/mapper/
-      RAM/OAM/VRAM). Most-expected missing feature; also the substrate for TAS/netplay.
+- [x] **Save states + rewind** — ✅ done. `StateSerializer` (one bidirectional pass) + `SerializeState`
+      on CPU/PPU/APU(+channels)/every mapper/`VrcIrq`; `NesMachine.SaveState()/LoadState()` with a
+      magic/version/mapper-guarded header. Host: **8 timestamped save-state slots** (picker +
+      Save/Load/Delete) at `~/.nes-runtime/save/<rom>/state<N>.bin`, plus a per-frame rewind ring
+      (`RewindBuffer`, ~20 s) with a hold-to-rewind control. Verified by idempotent-round-trip +
+      deterministic-replay tests.
 - [ ] **PAL + Dendy** region support with auto-detect (parameterize the hardcoded NTSC timing in
       `Ppu`/`NesMachine`/`Apu`).
 - [ ] **Mapper batch:** MMC5 (5), Namco 163 (19), VRC7 (85), + common unlicensed/multicart mappers.
-- [ ] **Expansion audio:** synthesize the already-decoded VRC6/FME-7; add VRC7 FM, Namco 163, MMC5.
+- [~] **Expansion audio:** ✅ VRC6 (2 pulse + sawtooth) and FME-7 Sunsoft 5B (3 YM2149 square channels,
+      4-bit log volume) synthesized and mixed into the APU via `IMapper.AudioSample()`. Remaining: 5B
+      noise + hardware envelope, and the other expansion chips — VRC7 FM, Namco 163, MMC5.
 - [ ] **Peripherals:** Zapper, Four Score (4-player), Power Pad.
 - [ ] **FDS** (Famicom Disk System) — large library unlock.
-- [ ] Apply **PPUMASK grayscale/emphasis** bits (small, closes a visible gap).
+- [x] Apply **PPUMASK grayscale/emphasis** bits — ✅ done. Grayscale is a per-pixel index mask in
+      `Ppu.Palette`; color emphasis is captured per frame (`NesMachine.Emphasis`) and tints the frame
+      host-side via `FrameBuffer.Emphasis` → `MasterPalette.ToRgb`. Verified by harness tests.
 
 ### Tier B — accuracy parity (the hard core, several months)
 

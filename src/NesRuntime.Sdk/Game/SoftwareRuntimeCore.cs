@@ -43,6 +43,7 @@ internal sealed class SoftwareRuntimeCore : IRuntimeCore
         // otherwise the SDK tile/sprite compositor renders the frame.
         if (!_game.RunRenderFramebuffer(_frame.Pixels))
             _graphics.Render(_frame);
+        _frame.Emphasis = _game.FrameEmphasis; // PPUMASK tint the backend applies at resolve time
 
         PumpAudio(audio);          // synthesize this frame's samples and hand them to the host
         _game.AdvanceFrame();

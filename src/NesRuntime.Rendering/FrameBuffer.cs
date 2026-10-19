@@ -21,6 +21,9 @@ public sealed class FrameBuffer
     /// <summary>The writable pixel buffer a frame producer (the PPU) composites into.</summary>
     public Span<byte> Pixels => _indices;
 
+    /// <summary>PPUMASK color emphasis for this frame; a video backend passes it to <see cref="ResolveTo"/>.</summary>
+    public ColorEmphasis Emphasis { get; set; }
+
     /// <summary>Resolves the frame to packed 0xRRGGBB pixels using the given palette/emphasis.</summary>
     public void ResolveTo(Span<int> rgbDestination, MasterPalette palette, ColorEmphasis emphasis = default)
     {

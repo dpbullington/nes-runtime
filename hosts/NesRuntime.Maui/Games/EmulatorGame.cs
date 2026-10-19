@@ -28,15 +28,27 @@ public sealed class EmulatorGame : NesGame
     /// folder. Assign alongside <see cref="RomImage"/>.</summary>
     public static string? RomName;
 
-    /// <summary>Human-readable outcome of the last battery restore/save, surfaced by the host so a
-    /// silent path/permission failure is visible rather than looking like "saves don't work".</summary>
+    /// <summary>Human-readable outcome of the last battery restore/save, or save-state/rewind action —
+    /// surfaced by the host so a silent path/permission failure is visible.</summary>
     public static string BatteryStatus = "";
+
+    /// <summary>Set by the host while the Rewind control is held; the game then plays recent frames backward.</summary>
+    public static bool RewindHeld;
+
+    /// <summary>Number of manual save-state slots the host exposes.</summary>
+    public const int SlotCount = 8;
 
     // The one running emulator instance, so the host can flush its battery on stop/quit.
     private static EmulatorGame? _current;
 
     // How often (in frames, ~60/s) to check the battery RAM for changes and flush it to disk.
     private const int AutosaveIntervalFrames = 60;
+
+    // Rewind history: a per-frame ring of machine states (+ the input applied that frame). At ~22 KB
+    // per state this is roughly 30 MB for 20 s, which is fine on desktop.
+    private const int RewindCapacityFrames = 1200;
+    private readonly RewindBuffer _rewind = new(RewindCapacityFrames);
+    private NesButton _in0, _in1;
 
     private NesMachine _machine = null!;
     private string? _batteryPath;
@@ -52,6 +64,8 @@ public sealed class EmulatorGame : NesGame
         _current = this;
         _batteryPath = null;
         _lastBattery = [];
+        _rewind.Clear();
+        RewindHeld = false;
 
         // Only battery-backed cartridges persist their PRG-RAM; restore any prior save now.
         if (!_machine.HasBattery)
@@ -65,14 +79,16 @@ public sealed class EmulatorGame : NesGame
             return;
         }
 
-        _batteryPath = ResolveBatteryPath(RomName!);
+        _batteryPath = ResolveSavePath("battery.bin");
         TryLoadBattery();
     }
 
     protected override void Update()
     {
-        _machine.SetButtons(0, ReadPad(0));
-        _machine.SetButtons(1, ReadPad(1));
+        _in0 = ReadPad(0);
+        _in1 = ReadPad(1);
+        _machine.SetButtons(0, _in0);
+        _machine.SetButtons(1, _in1);
 
         // Autosave on change so an app force-quit loses at most ~1s of battery RAM.
         if (_batteryPath is not null && ++_framesSinceSave >= AutosaveIntervalFrames)
@@ -91,7 +107,21 @@ public sealed class EmulatorGame : NesGame
 
     protected override bool RenderFramebuffer(Span<byte> framebuffer)
     {
-        _machine.StepFrame(framebuffer); // steps the whole frame: video + APU audio
+        if (RewindHeld && _rewind.TryPopBack(out byte[] state, out NesButton in0, out NesButton in1))
+        {
+            // Play backward: restore an older state, replay its input, and re-render that frame.
+            _machine.LoadState(state);
+            _machine.SetButtons(0, in0);
+            _machine.SetButtons(1, in1);
+            _machine.StepFrame(framebuffer);
+        }
+        else
+        {
+            // Forward: snapshot the pre-step state (+ this frame's input) so it can be rewound later.
+            _rewind.Push(_machine.SaveState(), _in0, _in1);
+            _machine.StepFrame(framebuffer); // steps the whole frame: video + APU audio
+        }
+        ReportEmphasis((NesRuntime.Core.Ppu.ColorEmphasis)_machine.Emphasis); // PPUMASK R/G/B tint for the host
         return true;
     }
 
@@ -172,13 +202,16 @@ public sealed class EmulatorGame : NesGame
         }
     }
 
-    // ~/.nes-runtime/save/<rom-name>/battery.bin. Tries the user profile home first (honoring "~");
-    // if that isn't writable — e.g. the App Sandbox denies the real home — it falls back to the app's
-    // guaranteed-writable data container, keeping the same folder shape. Returns the first base whose
-    // directory it can actually create (the create doubles as a writability probe).
-    private static string? ResolveBatteryPath(string romName)
+    // ~/.nes-runtime/save/<rom-name>/<fileName> (battery.bin or state0.bin). Tries the user profile home
+    // first (honoring "~"); if that isn't writable — e.g. the App Sandbox denies the real home — it
+    // falls back to the app's guaranteed-writable data container, keeping the same folder shape. Returns
+    // the first base whose directory it can actually create (the create doubles as a writability probe).
+    private static string? ResolveSavePath(string fileName)
     {
-        string safe = string.Concat(romName.Split(Path.GetInvalidFileNameChars()));
+        if (string.IsNullOrEmpty(RomName))
+            return null;
+
+        string safe = string.Concat(RomName!.Split(Path.GetInvalidFileNameChars()));
         if (string.IsNullOrWhiteSpace(safe))
             safe = "rom";
 
@@ -190,7 +223,7 @@ public sealed class EmulatorGame : NesGame
             {
                 string dir = Path.Combine(baseDir, ".nes-runtime", "save", safe);
                 Directory.CreateDirectory(dir); // also probes that this base is writable
-                return Path.Combine(dir, "battery.bin");
+                return Path.Combine(dir, fileName);
             }
             catch
             {
@@ -198,6 +231,68 @@ public sealed class EmulatorGame : NesGame
             }
         }
         return null;
+    }
+
+    // --- Save states (manual, multi-slot) ---
+
+    /// <summary>Metadata for one save-state slot, for the host's slot picker.</summary>
+    public readonly record struct SlotInfo(int Index, bool Exists, DateTime Time);
+
+    private static string SlotFile(int slot) => $"state{slot}.bin";
+
+    /// <summary>Lists all slots for the current ROM with their on-disk timestamps (read-only; safe any time).</summary>
+    public static SlotInfo[] GetSlots()
+    {
+        var slots = new SlotInfo[SlotCount];
+        for (int i = 0; i < SlotCount; i++)
+        {
+            string? path = ResolveSavePath(SlotFile(i));
+            bool exists = path is not null && File.Exists(path);
+            slots[i] = new SlotInfo(i, exists, exists ? File.GetLastWriteTime(path!) : default);
+        }
+        return slots;
+    }
+
+    // These run on the UI thread between frames (the whole loop is single-threaded), so touching the
+    // machine directly is safe — no need to defer to Update.
+    public static void SaveToSlot(int slot) => _current?.SaveStateToSlot(slot);
+    public static void LoadFromSlot(int slot) => _current?.LoadStateFromSlot(slot);
+
+    /// <summary>Deletes a slot file (pure file I/O — no running game required).</summary>
+    public static void DeleteSlot(int slot)
+    {
+        string? path = ResolveSavePath(SlotFile(slot));
+        try
+        {
+            if (path is not null && File.Exists(path)) { File.Delete(path); BatteryStatus = $"💾 deleted slot {slot + 1}"; }
+            else BatteryStatus = $"💾 slot {slot + 1} is already empty";
+        }
+        catch (Exception ex) { BatteryStatus = $"💾 delete error: {ex.Message}"; }
+    }
+
+    private void SaveStateToSlot(int slot)
+    {
+        string? path = ResolveSavePath(SlotFile(slot));
+        if (path is null) { BatteryStatus = "💾 no writable location for save state"; return; }
+        try
+        {
+            File.WriteAllBytes(path, _machine.SaveState());
+            BatteryStatus = $"💾 saved slot {slot + 1}";
+        }
+        catch (Exception ex) { BatteryStatus = $"💾 save-state error: {ex.Message}"; }
+    }
+
+    private void LoadStateFromSlot(int slot)
+    {
+        string? path = ResolveSavePath(SlotFile(slot));
+        if (path is null || !File.Exists(path)) { BatteryStatus = $"💾 slot {slot + 1} is empty"; return; }
+        try
+        {
+            _machine.LoadState(File.ReadAllBytes(path));
+            _rewind.Clear(); // old rewind history no longer matches the restored timeline
+            BatteryStatus = $"💾 loaded slot {slot + 1}";
+        }
+        catch (Exception ex) { BatteryStatus = $"💾 load-state error: {ex.Message}"; }
     }
 
     private static IEnumerable<string?> SaveBaseCandidates()
@@ -248,5 +343,41 @@ public sealed class EmulatorGame : NesGame
         Array.Copy(prg, 0, img, 16, prg.Length);
         Array.Copy(chr, 0, img, 16 + prg.Length, chr.Length);
         return img;
+    }
+
+    /// <summary>
+    /// A fixed-capacity ring of recent machine save-states (+ the controller input applied that
+    /// frame). Pushing past capacity overwrites the oldest frame; popping the back yields the most
+    /// recent frame, which is how rewind walks the timeline backward.
+    /// </summary>
+    private sealed class RewindBuffer(int capacity)
+    {
+        private readonly byte[]?[] _state = new byte[capacity][];
+        private readonly NesButton[] _in0 = new NesButton[capacity];
+        private readonly NesButton[] _in1 = new NesButton[capacity];
+        private int _head, _count;
+
+        public bool TryPopBack(out byte[] state, out NesButton in0, out NesButton in1)
+        {
+            if (_count == 0) { state = []; in0 = in1 = NesButton.None; return false; }
+            _count--;
+            int i = (_head + _count) % _state.Length;
+            state = _state[i]!;
+            in0 = _in0[i];
+            in1 = _in1[i];
+            return true;
+        }
+
+        public void Push(byte[] state, NesButton in0, NesButton in1)
+        {
+            int i = (_head + _count) % _state.Length;
+            if (_count < _state.Length) _count++;
+            else _head = (_head + 1) % _state.Length; // full: drop the oldest
+            _state[i] = state;
+            _in0[i] = in0;
+            _in1[i] = in1;
+        }
+
+        public void Clear() { _head = 0; _count = 0; }
     }
 }
