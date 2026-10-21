@@ -9,12 +9,20 @@ namespace NesRuntime.Rendering;
 public sealed class RuntimeHost
 {
     private readonly IRuntimeCore _core;
+    private readonly IAudioBackend _silentAudio;
     private bool _running;
 
     public IVideoBackend Video { get; }
     public IAudioBackend Audio { get; }
     public IInputBackend Input { get; }
     public IFrameClock Clock { get; }
+
+    /// <summary>
+    /// Emulation frames to advance per displayed frame. 1 = realtime; &gt;1 = fast-forward (only the
+    /// last frame of each tick is presented, and the skipped frames' audio is dropped so the audio
+    /// buffer doesn't lag). Set it from the host (e.g. while a Fast-Forward control is held).
+    /// </summary>
+    public int SpeedMultiplier { get; set; } = 1;
 
     public RuntimeHost(
         IRuntimeCore core,
@@ -28,6 +36,7 @@ public sealed class RuntimeHost
         Audio = audio;
         Input = input;
         Clock = clock;
+        _silentAudio = new SilentAudioBackend(audio.SampleRate);
     }
 
     /// <summary>Starts the frame clock and begins driving the core.</summary>
@@ -59,7 +68,20 @@ public sealed class RuntimeHost
 
     private void PresentNextFrame()
     {
+        // Fast-forward: advance extra frames with audio dropped, present only the last with real audio.
+        int extra = Math.Max(1, SpeedMultiplier) - 1;
+        for (int i = 0; i < extra; i++)
+            _core.StepFrame(Input, _silentAudio);
+
         FrameBuffer frame = _core.StepFrame(Input, Audio);
         Video.Present(frame);
+    }
+
+    /// <summary>An audio sink that reports the output rate but discards samples (used for the skipped
+    /// frames during fast-forward, so queuing N× audio can't back up the real buffer).</summary>
+    private sealed class SilentAudioBackend(int sampleRate) : IAudioBackend
+    {
+        public int SampleRate { get; } = sampleRate;
+        public void QueueSamples(ReadOnlySpan<float> samples) { }
     }
 }

@@ -133,6 +133,9 @@ Three layers, strict one-way dependency `Sdk → Rendering → Core`:
   per-frame `RewindBuffer` ring (~20 s of `NesMachine.SaveState()` snapshots + that frame's input);
   holding the Rewind button (`RewindHeld` static) pops snapshots and re-renders them backward. All
   outcomes show on the `🔋` status line.
+  **Fast-forward:** `RuntimeHost.SpeedMultiplier` (default 1) advances N emulation frames per displayed
+  frame, presenting only the last and dropping the skipped frames' audio (via an internal
+  `SilentAudioBackend`) so the audio buffer can't back up; holding the Fast-Fwd button sets it to 4×.
 - **`src/NesRuntime.Emulation`** — a self-contained NES execution core that runs real ROMs, distinct
   from the C# authoring SDK: `Mos6502` (full official **and** unofficial/illegal 6502 opcode set —
   LAX/SAX/DCP/ISC/SLO/RLA/SRE/RRA/ANC/ALR/ARR/SBX/undocumented NOPs + unstable stores — plus a

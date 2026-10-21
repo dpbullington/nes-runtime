@@ -19,6 +19,7 @@ public partial class MainPage : ContentPage
 {
     // NTSC frame rate (~60.10 Hz).
     private const double NtscFps = 60.0988;
+    private const int FastForwardSpeed = 4; // emulation frames per displayed frame while Fast-Fwd is held
 
     private readonly NesGameView _screen = new();
     private readonly MauiInputBackend _input = new();
@@ -247,11 +248,15 @@ public partial class MainPage : ContentPage
         rewindButton.Pressed += (_, _) => EmulatorGame.RewindHeld = true;
         rewindButton.Released += (_, _) => EmulatorGame.RewindHeld = false;
 
+        var ffButton = new Button { Text = "⏩ Fast-Fwd (hold)" };
+        ffButton.Pressed += (_, _) => { if (_host is not null) _host.SpeedMultiplier = FastForwardSpeed; };
+        ffButton.Released += (_, _) => { if (_host is not null) _host.SpeedMultiplier = 1; };
+
         var stateRow = new HorizontalStackLayout
         {
             Spacing = 10,
             HorizontalOptions = LayoutOptions.Center,
-            Children = { _slotPicker, saveStateButton, loadStateButton, deleteStateButton, rewindButton },
+            Children = { _slotPicker, saveStateButton, loadStateButton, deleteStateButton, rewindButton, ffButton },
         };
 
         RefreshSlots();
